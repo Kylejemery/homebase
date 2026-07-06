@@ -27,6 +27,21 @@ import * as path from "path";
 import * as readline from "readline";
 import * as os from "os";
 
+// Keep in sync with package.json
+const VERSION = "0.1.0";
+
+const HELP_TEXT = `Homebase ${VERSION} — a distributable household logistics agent
+
+Usage:
+  homebase                       interactive terminal chat
+  homebase --task "..."          one-shot task (for cron / Task Scheduler)
+  homebase --telegram            Telegram bot mode — family texts the agent
+  homebase --version, -v         print version
+  homebase --help, -h            show this help
+
+Data lives in ~/.homebase/ as plain JSON. First run walks through setup
+(Anthropic API key, optional Vapi phone-calling config).`;
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Storage — plain JSON files in ~/.homebase
 // ═══════════════════════════════════════════════════════════════════════════
@@ -58,6 +73,10 @@ interface Config {
   vapiPhoneNumberId?: string;
   ownerName?: string;
   ownerCallback?: string;
+  setupComplete?: boolean;
+  telegramOwnerChatId?: number;
+  telegramApproved?: number[];
+  telegramPending?: number[];
 }
 
 function askOnce(question: string): Promise<string> {
@@ -73,10 +92,24 @@ function askOnce(question: string): Promise<string> {
 async function getConfig(): Promise<Config> {
   const cfg = load<Config>("config", {});
   if (process.env.ANTHROPIC_API_KEY) cfg.apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!cfg.apiKey) {
-    cfg.apiKey = await askOnce("First run — paste your Anthropic API key: ");
+
+  if (!cfg.setupComplete) {
+    console.log("Welcome to Homebase — first-run setup.\n");
+    if (!cfg.apiKey) {
+      cfg.apiKey = await askOnce("Anthropic API key: ");
+    }
+    const wantsCalls = await askOnce("Set up phone calling via Vapi now? (y/N): ");
+    if (/^y/i.test(wantsCalls)) {
+      cfg.vapiApiKey = (await askOnce("Vapi API key (dashboard.vapi.ai): ")) || cfg.vapiApiKey;
+      cfg.vapiPhoneNumberId = (await askOnce("Vapi phone number id: ")) || cfg.vapiPhoneNumberId;
+      cfg.ownerName = (await askOnce("Your name (used in call briefings): ")) || cfg.ownerName;
+      cfg.ownerCallback = (await askOnce("Callback number for voicemails (+1...): ")) || cfg.ownerCallback;
+    } else {
+      console.log(`Skipping — add Vapi keys anytime by editing ${FILE("config")}\n`);
+    }
+    cfg.setupComplete = true;
     save("config", cfg);
-    console.log(`Saved to ${FILE("config")}\n`);
+    console.log(`Setup saved to ${FILE("config")}\n`);
   }
   return cfg;
 }
@@ -479,9 +512,29 @@ the number, the goal, and exactly what personal info you may share (pull known f
 ask for anything missing like DOB or insurance if the task needs it). After placing a call, tell the user
 you'll check back — then use check_phone_call when they ask, or on your next scheduled run.`;
 
+// Retries on transient overload/rate-limit errors (429/529/503) with exponential backoff + jitter.
+async function createWithRetry(
+  client: Anthropic,
+  params: Anthropic.MessageCreateParamsNonStreaming,
+  maxAttempts = 5
+): Promise<Anthropic.Message> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await client.messages.create(params);
+    } catch (err: any) {
+      const status = err?.status;
+      const retryable = status === 429 || status === 529 || status === 503;
+      if (!retryable || attempt >= maxAttempts) throw err;
+      const delay = Math.min(1000 * 2 ** attempt, 20000) + Math.random() * 500;
+      console.error(`  ⚠ API ${status} — retrying in ${(delay / 1000).toFixed(1)}s (attempt ${attempt}/${maxAttempts})`);
+      await new Promise((res) => setTimeout(res, delay));
+    }
+  }
+}
+
 async function runAgentTurn(client: Anthropic, history: Anthropic.MessageParam[], log = true): Promise<string> {
   while (true) {
-    const response = await client.messages.create({
+    const response = await createWithRetry(client, {
       model: "claude-sonnet-4-5",
       max_tokens: 1024,
       system: SYSTEM_PROMPT,
@@ -565,6 +618,8 @@ async function taskMode(client: Anthropic, task: string) {
 //   No public server needed — long polling works from behind any home router.
 // ═══════════════════════════════════════════════════════════════════════════
 
+type StoredSessions = Record<string, Anthropic.MessageParam[]>;
+
 async function telegramMode(client: Anthropic, cfg: Config) {
   if (!cfg.telegramBotToken) {
     cfg.telegramBotToken = await askOnce("Paste your Telegram bot token (from @BotFather): ");
@@ -577,7 +632,19 @@ async function telegramMode(client: Anthropic, cfg: Config) {
       body: JSON.stringify(params),
     }).then((r) => r.json() as any);
 
-  const sessions = new Map<number, Anthropic.MessageParam[]>();
+  const stored = load<StoredSessions>("sessions", {});
+  const sessions = new Map<number, Anthropic.MessageParam[]>(
+    Object.entries(stored).map(([id, h]) => [Number(id), h])
+  );
+  const saveSessions = () => {
+    const obj: StoredSessions = {};
+    for (const [id, h] of sessions) obj[String(id)] = h;
+    save("sessions", obj);
+  };
+
+  cfg.telegramApproved ??= [];
+  cfg.telegramPending ??= [];
+
   let offset = 0;
   console.log("Homebase is live on Telegram. Ctrl-C to stop.");
 
@@ -587,10 +654,53 @@ async function telegramMode(client: Anthropic, cfg: Config) {
       offset = u.update_id + 1;
       const msg = u.message;
       if (!msg?.text) continue;
-      const chatId = msg.chat.id;
+      const chatId: number = msg.chat.id;
+      const text: string = msg.text.trim();
+
+      // First person to ever message the bot becomes the owner/approver.
+      if (!cfg.telegramOwnerChatId) {
+        cfg.telegramOwnerChatId = chatId;
+        cfg.telegramApproved!.push(chatId);
+        save("config", cfg);
+        await api("sendMessage", {
+          chat_id: chatId,
+          text: "You're set as the Homebase owner. Anyone else who messages this bot will need your approval first.",
+        });
+      }
+
+      const isOwner = chatId === cfg.telegramOwnerChatId;
+
+      if (isOwner && text.startsWith("/approve")) {
+        const id = Number(text.split(/\s+/)[1]);
+        if (id && cfg.telegramPending!.includes(id)) {
+          cfg.telegramPending = cfg.telegramPending!.filter((p) => p !== id);
+          cfg.telegramApproved!.push(id);
+          save("config", cfg);
+          await api("sendMessage", { chat_id: id, text: "You've been approved — go ahead and message me." });
+          await api("sendMessage", { chat_id: chatId, text: `Approved ${id}.` });
+        } else {
+          await api("sendMessage", { chat_id: chatId, text: `No pending request for ${id || "(missing id)"}.` });
+        }
+        continue;
+      }
+
+      const approved = isOwner || cfg.telegramApproved!.includes(chatId);
+      if (!approved) {
+        if (!cfg.telegramPending!.includes(chatId)) {
+          cfg.telegramPending!.push(chatId);
+          save("config", cfg);
+          await api("sendMessage", {
+            chat_id: cfg.telegramOwnerChatId,
+            text: `${msg.from?.first_name ?? "Someone"} (chat id ${chatId}) wants to message Homebase. Reply /approve ${chatId} to allow.`,
+          });
+        }
+        await api("sendMessage", { chat_id: chatId, text: "This bot is private. Waiting for the owner's approval." });
+        continue;
+      }
+
       const history = sessions.get(chatId) ?? [];
       sessions.set(chatId, history);
-      history.push({ role: "user", content: `[from ${msg.from?.first_name ?? "family member"}] ${msg.text}` });
+      history.push({ role: "user", content: `[from ${msg.from?.first_name ?? "family member"}] ${text}` });
       try {
         const reply = await runAgentTurn(client, history, false);
         trimHistory(history);
@@ -598,6 +708,7 @@ async function telegramMode(client: Anthropic, cfg: Config) {
       } catch (err: any) {
         await api("sendMessage", { chat_id: chatId, text: `Error: ${err.message}` });
       }
+      saveSessions();
     }
   }
 }
@@ -607,9 +718,19 @@ async function telegramMode(client: Anthropic, cfg: Config) {
 // ═══════════════════════════════════════════════════════════════════════════
 
 async function main() {
+  const args = process.argv.slice(2);
+
+  if (args.includes("--version") || args.includes("-v")) {
+    console.log(`homebase ${VERSION}`);
+    return;
+  }
+  if (args.includes("--help") || args.includes("-h")) {
+    console.log(HELP_TEXT);
+    return;
+  }
+
   const cfg = await getConfig();
   const client = new Anthropic({ apiKey: cfg.apiKey });
-  const args = process.argv.slice(2);
 
   const taskIdx = args.indexOf("--task");
   if (taskIdx !== -1 && args[taskIdx + 1]) return taskMode(client, args[taskIdx + 1]);
