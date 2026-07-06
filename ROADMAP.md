@@ -21,11 +21,20 @@ allowlist and session persistence are implemented but not yet tested live agains
 the Telegram API (needs a bot token) — do that before family rollout.
 
 ## M2 — Real calendar + morning briefing (1–2 sessions)
-- [ ] Google Calendar integration via OAuth2 device flow (no browser redirect server):
-      new tools google_calendar_list / google_calendar_add; keep local calendar as fallback
-- [ ] `--task` presets: `--task morning-briefing` = today's events + weather + open list items,
-      formatted for Telegram delivery (add sendToTelegram option so cron output goes to the
-      family chat, not stdout)
+- [x] Google Calendar integration — NOTE: device flow doesn't allow Calendar scopes
+      (verified against Google's allowed-scope list), so this uses the standard
+      installed-app loopback flow instead: `--google-auth` runs a localhost listener
+      only for the seconds the browser approval takes. New tools google_calendar_list /
+      google_calendar_add; local calendar remains the fallback
+- [x] `--task` presets: `--task morning-briefing` = today's events + weather + open list items;
+      `--to-telegram` delivers the output to the owner's Telegram chat instead of stdout
+
+**Manual test note (2026-07-06):** typecheck clean. `--task morning-briefing --to-telegram`
+tested live: agent tried Google Calendar (graceful "not connected" fallback), read local
+calendar + memory + lists, and the briefing arrived in Kyle's Telegram chat. Google OAuth
+itself not yet exercised — needs Kyle to create the OAuth client (Desktop app) in
+console.cloud.google.com, then run `homebase --google-auth`. Cron/Task Scheduler entry
+for the daily run is also still a user-side step.
 
 ## M3 — Call workflow polish (1 session)
 - [ ] Auto-followup: after make_phone_call, schedule a check (setTimeout in
