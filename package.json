@@ -5,14 +5,16 @@
   "type": "module",
   "scripts": {
     "dev": "bun run homebase.ts",
-    "typecheck": "tsc --noEmit --strict --esModuleInterop --module nodenext --moduleResolution nodenext --target es2022 homebase.ts",
+    "typecheck": "tsc --noEmit --strict --esModuleInterop --module nodenext --moduleResolution nodenext --target es2022 homebase.ts demo-medspa-mcp/server.ts",
     "build": "bun build --compile homebase.ts --outfile dist/homebase",
     "build:mac": "bun build --compile --target=bun-darwin-arm64 homebase.ts --outfile dist/homebase-mac",
     "build:win": "bun build --compile --target=bun-windows-x64 homebase.ts --outfile dist/homebase-win.exe",
     "build:all": "bun run build:mac && bun run build:win"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.71.0"
+    "@anthropic-ai/sdk": "^0.71.0",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
     "typescript": "^5.9.0",

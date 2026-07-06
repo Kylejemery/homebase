@@ -22,6 +22,8 @@
  */
 
 import Anthropic from "@anthropic-ai/sdk";
+import { Client as McpClient } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import * as fs from "fs";
 import * as path from "path";
 import * as readline from "readline";
@@ -773,6 +775,46 @@ const TOOLS: AgentTool[] = [
   gcalListTool, gcalAddTool, phoneCallTool, checkCallTool,
 ];
 
+// ── MCP client — consume external MCP servers as extra agent tools ──────────
+//
+// This is how Homebase talks agent-to-agent with a business's booking system
+// instead of phoning it. Configure in ~/.homebase/config.json:
+//   "mcpServers": [{ "name": "medspa", "command": "bun",
+//                    "args": ["run", "C:\\...\\demo-medspa-mcp\\server.ts"] }]
+// Each remote tool is exposed to the agent as <server>_<tool>.
+
+async function connectMcpServers(): Promise<AgentTool[]> {
+  const cfg = load<Config>("config", {});
+  const tools: AgentTool[] = [];
+  for (const s of cfg.mcpServers ?? []) {
+    try {
+      const transport = new StdioClientTransport({ command: s.command, args: s.args ?? [] });
+      const mcp = new McpClient({ name: "homebase", version: VERSION });
+      await mcp.connect(transport);
+      const { tools: remote } = await mcp.listTools();
+      for (const rt of remote) {
+        const name = `${s.name}_${rt.name}`.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 64);
+        tools.push({
+          schema: {
+            name,
+            description: `[${s.name} MCP server] ${rt.description ?? ""}`.slice(0, 1024),
+            input_schema: rt.inputSchema as Anthropic.Tool["input_schema"],
+          },
+          handler: async (input) => {
+            const res = await mcp.callTool({ name: rt.name, arguments: input });
+            const content = (res.content ?? []) as any[];
+            return content.map((c) => (c.type === "text" ? c.text : JSON.stringify(c))).join("\n") || "(empty result)";
+          },
+        });
+      }
+      console.log(`  ⚡ MCP: connected '${s.name}' (${remote.map((t) => t.name).join(", ")})`);
+    } catch (err: any) {
+      console.error(`  ⚠ MCP: couldn't connect '${s.name}': ${err.message}`);
+    }
+  }
+  return tools;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Agent loop
 // ═══════════════════════════════════════════════════════════════════════════
@@ -886,7 +928,7 @@ async function terminalMode(client: Anthropic) {
     rl.question("you > ", async (line) => {
       const text = line.trim();
       if (!text) return ask();
-      if (text.toLowerCase() === "quit") return rl.close();
+      if (text.toLowerCase() === "quit") { rl.close(); process.exit(0); } // exit even with MCP children alive
       history.push({ role: "user", content: text });
       try {
         console.log(`\nhomebase > ${await runAgentTurn(client, history)}\n`);
@@ -1053,10 +1095,13 @@ async function main() {
 
   const cfg = await getConfig();
   const client = new Anthropic({ apiKey: cfg.apiKey });
+  TOOLS.push(...(await connectMcpServers()));
 
   const taskIdx = args.indexOf("--task");
-  if (taskIdx !== -1 && args[taskIdx + 1])
-    return taskMode(client, cfg, args[taskIdx + 1], args.includes("--to-telegram"));
+  if (taskIdx !== -1 && args[taskIdx + 1]) {
+    await taskMode(client, cfg, args[taskIdx + 1], args.includes("--to-telegram"));
+    process.exit(0); // MCP child processes would otherwise keep the event loop alive
+  }
   if (args.includes("--telegram")) return telegramMode(client, cfg);
   return terminalMode(client);
 }
