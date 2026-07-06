@@ -451,7 +451,8 @@ const phoneCallTool: AgentTool = {
           firstMessage: input.first_message,
           model: {
             provider: "anthropic",
-            model: "claude-sonnet-4-5",
+            // Vapi requires exact dated IDs (no aliases); fast model on live calls per CLAUDE.md
+            model: "claude-haiku-4-5-20251001",
             messages: [{ role: "system", content: CALL_AGENT_PROMPT(input.briefing, cfg) }],
             tools: [{ type: "dtmf" }, { type: "endCall" }],
           },
