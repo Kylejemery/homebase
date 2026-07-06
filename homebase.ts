@@ -668,25 +668,83 @@ const phoneCallTool: AgentTool = {
     });
     const data: any = await res.json();
     if (!res.ok) return `Call failed to start: ${JSON.stringify(data)}`;
-    return `Call placed (id: ${data.id}). Dialing ${input.phone_number} now. Use check_phone_call in a few minutes to get the outcome.`;
+    const calls = load<CallLogEntry[]>("calls", []);
+    calls.push({
+      id: data.id,
+      number: input.phone_number,
+      purpose: input.briefing.slice(0, 140),
+      placedAt: new Date().toISOString(),
+      status: "in-progress",
+    });
+    save("calls", calls);
+    PENDING_FOLLOWUPS.push(data.id);
+    return `Call placed (id: ${data.id}). Dialing ${input.phone_number} now. I'll follow up with the outcome automatically, or use check_phone_call to check sooner.`;
   },
 };
+
+interface CallLogEntry {
+  id: string;
+  number: string;
+  purpose: string;
+  placedAt: string;
+  status: string;
+  summary?: string;
+  endedAt?: string;
+}
+
+// Call ids awaiting an automatic outcome check — drained by the active interface
+// (terminal/Telegram) after each turn; task mode exits too fast to follow up.
+const PENDING_FOLLOWUPS: string[] = [];
+
+function scheduleCallFollowups(notify: (text: string) => void) {
+  for (const id of PENDING_FOLLOWUPS.splice(0)) {
+    let attempts = 0;
+    const poll = async () => {
+      attempts++;
+      let out: string;
+      try {
+        out = await checkCallTool.handler({ call_id: id });
+      } catch (err: any) {
+        out = `Followup check failed: ${err.message}`;
+      }
+      if (out.includes("Not finished yet") && attempts < 10) {
+        setTimeout(poll, 120_000);
+        return;
+      }
+      notify(`📞 Call followup:\n${out}`);
+    };
+    setTimeout(poll, 120_000);
+  }
+}
 
 const checkCallTool: AgentTool = {
   schema: {
     name: "check_phone_call",
     description:
       "Check the status/outcome of a phone call placed with make_phone_call. Returns status, summary, " +
-      "and transcript when the call has ended.",
+      "and transcript when the call has ended. OMIT call_id to see the call log (recent calls with " +
+      "their outcomes) — use that for questions like 'what calls have you made?'.",
     input_schema: {
       type: "object",
-      properties: { call_id: { type: "string" } },
-      required: ["call_id"],
+      properties: { call_id: { type: "string", description: "Omit to list recent calls instead" } },
+      required: [],
     },
   },
   handler: async (input) => {
     const cfg = vapiCfg();
     if (!cfg.vapiApiKey) return "Phone calling isn't configured.";
+    if (!input.call_id) {
+      const calls = load<CallLogEntry[]>("calls", []);
+      if (!calls.length) return "No calls placed yet.";
+      return calls
+        .slice(-10)
+        .reverse()
+        .map((c) => {
+          const when = new Date(c.placedAt).toLocaleString("en-US", { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+          return `${when} → ${c.number} [${c.status}] ${c.purpose}${c.summary ? `\n   outcome: ${c.summary}` : ""}\n   id: ${c.id}`;
+        })
+        .join("\n");
+    }
     const res = await fetch(`https://api.vapi.ai/call/${input.call_id}`, {
       headers: { Authorization: `Bearer ${cfg.vapiApiKey}` },
     });
@@ -696,6 +754,14 @@ const checkCallTool: AgentTool = {
       return `Call status: ${data.status}. Not finished yet — check again shortly.`;
     const summary = data.analysis?.summary ?? data.summary ?? "(no summary)";
     const transcript = (data.transcript ?? "").slice(0, 3000);
+    const calls = load<CallLogEntry[]>("calls", []);
+    const entry = calls.find((c) => c.id === input.call_id);
+    if (entry && entry.status !== "ended") {
+      entry.status = "ended";
+      entry.summary = String(summary).slice(0, 300);
+      entry.endedAt = new Date().toISOString();
+      save("calls", calls);
+    }
     return `Call ended (${data.endedReason ?? "unknown reason"}).\nSUMMARY: ${summary}\n\nTRANSCRIPT:\n${transcript}`;
   },
 };
@@ -804,6 +870,7 @@ async function terminalMode(client: Anthropic) {
         console.error(`Error: ${err.message}\n`);
       }
       trimHistory(history);
+      scheduleCallFollowups((t) => console.log(`\n${t}\n`));
       ask();
     });
   ask();
@@ -934,6 +1001,9 @@ async function telegramMode(client: Anthropic, cfg: Config) {
       } catch (err: any) {
         await api("sendMessage", { chat_id: chatId, text: `Error: ${err.message}` });
       }
+      // Proactively message call outcomes back to whoever asked for the call.
+      // Not appended to history — the call log (calls.json) is the source of truth.
+      scheduleCallFollowups((t) => api("sendMessage", { chat_id: chatId, text: t }));
       saveSessions();
     }
   }
