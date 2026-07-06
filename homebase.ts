@@ -85,6 +85,8 @@ interface Config {
   googleClientId?: string;
   googleClientSecret?: string;
   googleTokens?: { access_token: string; refresh_token?: string; expires_at?: number };
+  haikuRouting?: boolean; // false disables fast-model routing of trivial turns
+  mcpServers?: { name: string; command: string; args?: string[] }[];
 }
 
 function askOnce(question: string): Promise<string> {
@@ -785,6 +787,26 @@ the number, the goal, and exactly what personal info you may share (pull known f
 ask for anything missing like DOB or insurance if the task needs it). After placing a call, tell the user
 you'll check back — then use check_phone_call when they ask, or on your next scheduled run.`;
 
+// ── Model tiering (mirror of the Arete router pattern) ─────────────────────
+// Trivial single-tool turns (list add/check/show) route to Haiku; everything
+// else stays on the strong orchestrator model. Set "haikuRouting": false in
+// config.json to disable.
+
+const STRONG_MODEL = "claude-sonnet-4-5";
+const FAST_MODEL = "claude-haiku-4-5";
+
+const TRIVIAL_TURN =
+  /^(add|put|buy)\b.{0,60}\b(to|on)\b.{0,40}\b(list|grocery|groceries|todos?|packing|shopping)\b|^(check( off)?|mark|uncheck|complete)\b.{0,50}(#?\d+|done)|^(show|what'?s on)\b.{0,30}\b(list|lists|grocery|groceries|todos?|packing|shopping)\b/i;
+
+function pickModelForTurn(history: Anthropic.MessageParam[]): string {
+  const cfg = load<Config>("config", {});
+  if (cfg.haikuRouting === false) return STRONG_MODEL;
+  const last = history.at(-1);
+  if (typeof last?.content !== "string") return STRONG_MODEL;
+  const text = last.content.replace(/^\[from [^\]]+\]\s*/, "").trim(); // strip Telegram sender prefix
+  return TRIVIAL_TURN.test(text) ? FAST_MODEL : STRONG_MODEL;
+}
+
 // Retries on transient overload/rate-limit errors (429/529/503) with exponential backoff + jitter.
 async function createWithRetry(
   client: Anthropic,
@@ -806,9 +828,11 @@ async function createWithRetry(
 }
 
 async function runAgentTurn(client: Anthropic, history: Anthropic.MessageParam[], log = true): Promise<string> {
+  const model = pickModelForTurn(history);
+  if (log && model === FAST_MODEL) console.log(`  ⚡ routing trivial turn to ${FAST_MODEL}`);
   while (true) {
     const response = await createWithRetry(client, {
-      model: "claude-sonnet-4-5",
+      model,
       max_tokens: 1024,
       system: SYSTEM_PROMPT,
       tools: TOOLS.map((t) => t.schema),
