@@ -26,6 +26,8 @@ import * as fs from "fs";
 import * as path from "path";
 import * as readline from "readline";
 import * as os from "os";
+import * as http from "http";
+import { exec } from "child_process";
 
 // Keep in sync with package.json
 const VERSION = "0.1.0";
@@ -35,7 +37,10 @@ const HELP_TEXT = `Homebase ${VERSION} — a distributable household logistics a
 Usage:
   homebase                       interactive terminal chat
   homebase --task "..."          one-shot task (for cron / Task Scheduler)
+  homebase --task morning-briefing   preset: today's events + weather + open lists
+  homebase --to-telegram         with --task: deliver output to the owner's Telegram chat
   homebase --telegram            Telegram bot mode — family texts the agent
+  homebase --google-auth         connect Google Calendar (one-time OAuth in your browser)
   homebase --version, -v         print version
   homebase --help, -h            show this help
 
@@ -77,6 +82,9 @@ interface Config {
   telegramOwnerChatId?: number;
   telegramApproved?: number[];
   telegramPending?: number[];
+  googleClientId?: string;
+  googleClientSecret?: string;
+  googleTokens?: { access_token: string; refresh_token?: string; expires_at?: number };
 }
 
 function askOnce(question: string): Promise<string> {
@@ -380,6 +388,203 @@ const filesTool: AgentTool = {
   },
 };
 
+// ── Google Calendar (OAuth loopback flow; local calendar stays as fallback) ─
+//
+// Google's device flow doesn't allow Calendar scopes, so we use the standard
+// installed-app loopback flow: a localhost listener that exists only for the
+// seconds it takes the user to approve in their browser. One-time setup:
+//   1. console.cloud.google.com → create project → enable Google Calendar API
+//   2. OAuth consent screen → add yourself as a test user
+//   3. Credentials → Create OAuth client ID → type "Desktop app"
+//   4. Run: homebase --google-auth   (paste client id + secret when prompted)
+
+const GOOGLE_SCOPE = "https://www.googleapis.com/auth/calendar.events";
+
+async function googleAccessToken(): Promise<string | null> {
+  const cfg = load<Config>("config", {});
+  const t = cfg.googleTokens;
+  if (!t || !cfg.googleClientId || !cfg.googleClientSecret) return null;
+  if (t.expires_at && Date.now() < t.expires_at - 60_000) return t.access_token;
+  if (!t.refresh_token) return null;
+  const res = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      client_id: cfg.googleClientId,
+      client_secret: cfg.googleClientSecret,
+      refresh_token: t.refresh_token,
+      grant_type: "refresh_token",
+    }),
+  });
+  const data: any = await res.json();
+  if (!res.ok) return null;
+  cfg.googleTokens = {
+    ...t,
+    access_token: data.access_token,
+    expires_at: Date.now() + (data.expires_in ?? 3600) * 1000,
+  };
+  save("config", cfg);
+  return data.access_token;
+}
+
+async function googleConnect() {
+  const cfg = load<Config>("config", {});
+  if (!cfg.googleClientId || !cfg.googleClientSecret) {
+    console.log(
+      "One-time Google setup: console.cloud.google.com → enable Calendar API →\n" +
+        "OAuth consent screen (add yourself as test user) → Credentials → OAuth client ID, type 'Desktop app'.\n"
+    );
+    cfg.googleClientId = await askOnce("Google OAuth client ID: ");
+    cfg.googleClientSecret = await askOnce("Google OAuth client secret: ");
+    save("config", cfg);
+  }
+
+  const { code, redirectUri } = await new Promise<{ code: string; redirectUri: string }>((resolve, reject) => {
+    const server = http.createServer((req, res) => {
+      const url = new URL(req.url ?? "/", "http://127.0.0.1");
+      const c = url.searchParams.get("code");
+      const err = url.searchParams.get("error");
+      if (!c && !err) { res.writeHead(404); res.end(); return; } // favicon etc.
+      res.writeHead(200, { "Content-Type": "text/html" });
+      res.end(c ? "<h2>Homebase is connected to Google Calendar. You can close this tab.</h2>" : `<h2>Auth failed: ${err}</h2>`);
+      const port = (server.address() as any).port;
+      server.close();
+      c ? resolve({ code: c, redirectUri: `http://127.0.0.1:${port}` }) : reject(new Error(err ?? "no code returned"));
+    });
+    server.listen(0, "127.0.0.1", () => {
+      const port = (server.address() as any).port;
+      const authUrl =
+        "https://accounts.google.com/o/oauth2/v2/auth?" +
+        new URLSearchParams({
+          client_id: cfg.googleClientId!,
+          redirect_uri: `http://127.0.0.1:${port}`,
+          response_type: "code",
+          scope: GOOGLE_SCOPE,
+          access_type: "offline",
+          prompt: "consent",
+        });
+      console.log(`\nOpen this URL in your browser to approve access:\n\n${authUrl}\n`);
+      const opener = process.platform === "win32" ? `start "" "${authUrl}"` : process.platform === "darwin" ? `open "${authUrl}"` : `xdg-open "${authUrl}"`;
+      exec(opener, () => {}); // best effort — the printed URL is the fallback
+    });
+    setTimeout(() => { server.close(); reject(new Error("Timed out waiting for browser approval (5 min).")); }, 300_000);
+  });
+
+  const res = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      client_id: cfg.googleClientId!,
+      client_secret: cfg.googleClientSecret!,
+      code,
+      redirect_uri: redirectUri,
+      grant_type: "authorization_code",
+    }),
+  });
+  const data: any = await res.json();
+  if (!res.ok) throw new Error(`Token exchange failed: ${JSON.stringify(data)}`);
+  cfg.googleTokens = {
+    access_token: data.access_token,
+    refresh_token: data.refresh_token,
+    expires_at: Date.now() + (data.expires_in ?? 3600) * 1000,
+  };
+  save("config", cfg);
+  console.log("Google Calendar connected. Homebase will now prefer it over the local calendar.");
+}
+
+const GCAL_NOT_CONNECTED =
+  "Google Calendar isn't connected (run: homebase --google-auth). Use the local manage_calendar tool instead.";
+
+const gcalFmt = (e: any) => {
+  const start = e.start?.dateTime ?? e.start?.date ?? "?";
+  const when = e.start?.dateTime
+    ? new Date(e.start.dateTime).toLocaleString("en-US", { weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })
+    : `${start} (all day)`;
+  return `${when} — ${e.summary ?? "(untitled)"}${e.location ? ` @ ${e.location}` : ""}`;
+};
+
+const gcalListTool: AgentTool = {
+  schema: {
+    name: "google_calendar_list",
+    description:
+      "List events from the family's real Google Calendar (primary). Prefer this over manage_calendar for " +
+      "READING the schedule when connected. Use 'date' for one day or 'days' for the next N days.",
+    input_schema: {
+      type: "object",
+      properties: {
+        date: { type: "string", description: "YYYY-MM-DD for a single day" },
+        days: { type: "number", description: "Days ahead from now (default 1)" },
+      },
+      required: [],
+    },
+  },
+  handler: async (input) => {
+    const token = await googleAccessToken();
+    if (!token) return GCAL_NOT_CONNECTED;
+    let timeMin: string, timeMax: string;
+    if (input.date) {
+      timeMin = new Date(`${input.date}T00:00:00`).toISOString();
+      timeMax = new Date(`${input.date}T23:59:59`).toISOString();
+    } else {
+      timeMin = new Date().toISOString();
+      timeMax = new Date(Date.now() + (input.days ?? 1) * 86400000).toISOString();
+    }
+    const res = await fetch(
+      `https://www.googleapis.com/calendar/v3/calendars/primary/events?` +
+        new URLSearchParams({ timeMin, timeMax, singleEvents: "true", orderBy: "startTime", maxResults: "25" }),
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    const data: any = await res.json();
+    if (!res.ok) return `Google Calendar error: ${data.error?.message ?? res.status}`;
+    const items = data.items ?? [];
+    return items.length ? items.map(gcalFmt).join("\n") : "Nothing on the Google calendar for that window.";
+  },
+};
+
+const gcalAddTool: AgentTool = {
+  schema: {
+    name: "google_calendar_add",
+    description:
+      "Add an event to the family's real Google Calendar (primary). Prefer this over manage_calendar for " +
+      "ADDING events when connected. Resolve relative dates to ISO datetimes first.",
+    input_schema: {
+      type: "object",
+      properties: {
+        title: { type: "string" },
+        start: { type: "string", description: "ISO datetime, e.g. 2026-07-11T15:00" },
+        end: { type: "string", description: "ISO datetime (default: start + 1 hour)" },
+        all_day: { type: "boolean", description: "All-day event (start is then YYYY-MM-DD)" },
+        location: { type: "string" },
+        notes: { type: "string" },
+      },
+      required: ["title", "start"],
+    },
+  },
+  handler: async (input) => {
+    const token = await googleAccessToken();
+    if (!token) return GCAL_NOT_CONNECTED;
+    const body: any = { summary: input.title, location: input.location, description: input.notes };
+    if (input.all_day) {
+      const day = input.start.slice(0, 10);
+      const next = new Date(new Date(`${day}T00:00:00`).getTime() + 86400000).toISOString().slice(0, 10);
+      body.start = { date: day };
+      body.end = { date: next };
+    } else {
+      const startMs = new Date(input.start).getTime();
+      body.start = { dateTime: new Date(startMs).toISOString() };
+      body.end = { dateTime: new Date(input.end ? new Date(input.end).getTime() : startMs + 3600000).toISOString() };
+    }
+    const res = await fetch("https://www.googleapis.com/calendar/v3/calendars/primary/events", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data: any = await res.json();
+    if (!res.ok) return `Google Calendar error: ${data.error?.message ?? res.status}`;
+    return `Added to Google Calendar: ${gcalFmt(data)}${data.htmlLink ? `\n${data.htmlLink}` : ""}`;
+  },
+};
+
 // ── Phone calls via Vapi (make appointments, check on service requests) ────
 //
 // Requires in ~/.homebase/config.json:
@@ -496,7 +701,8 @@ const checkCallTool: AgentTool = {
 };
 
 const TOOLS: AgentTool[] = [
-  listsTool, calendarTool, memoryTool, weatherTool, filesTool, phoneCallTool, checkCallTool,
+  listsTool, calendarTool, memoryTool, weatherTool, filesTool,
+  gcalListTool, gcalAddTool, phoneCallTool, checkCallTool,
 ];
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -608,9 +814,28 @@ async function terminalMode(client: Anthropic) {
 //   ./homebase --task "text me anything on the calendar today and the weather"
 // ═══════════════════════════════════════════════════════════════════════════
 
-async function taskMode(client: Anthropic, task: string) {
+const MORNING_BRIEFING_TASK = (cfg: Config) =>
+  `Compose the family's morning briefing for today:
+1. Today's calendar — check Google Calendar if connected, plus the local family calendar.
+2. Current weather${cfg.homeCity ? ` in ${cfg.homeCity}` : " (look for a home city in family_memory; if none, skip weather)"}.
+3. Open items across all lists (skip empty ones).
+Format it as one friendly, compact message with short sections — it's going to a family group chat.`;
+
+async function taskMode(client: Anthropic, cfg: Config, task: string, toTelegram: boolean) {
+  if (task === "morning-briefing") task = MORNING_BRIEFING_TASK(cfg);
   const history: Anthropic.MessageParam[] = [{ role: "user", content: task }];
-  console.log(await runAgentTurn(client, history));
+  const result = await runAgentTurn(client, history);
+  if (toTelegram && cfg.telegramBotToken && cfg.telegramOwnerChatId) {
+    const res: any = await fetch(`https://api.telegram.org/bot${cfg.telegramBotToken}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: cfg.telegramOwnerChatId, text: result }),
+    }).then((r) => r.json());
+    console.log(res.ok ? "Delivered to Telegram." : `Telegram delivery failed: ${JSON.stringify(res)}`);
+  } else {
+    if (toTelegram) console.error("(--to-telegram needs telegramBotToken + an owner chat — printing instead)");
+    console.log(result);
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -730,11 +955,14 @@ async function main() {
     return;
   }
 
+  if (args.includes("--google-auth")) return googleConnect();
+
   const cfg = await getConfig();
   const client = new Anthropic({ apiKey: cfg.apiKey });
 
   const taskIdx = args.indexOf("--task");
-  if (taskIdx !== -1 && args[taskIdx + 1]) return taskMode(client, args[taskIdx + 1]);
+  if (taskIdx !== -1 && args[taskIdx + 1])
+    return taskMode(client, cfg, args[taskIdx + 1], args.includes("--to-telegram"));
   if (args.includes("--telegram")) return telegramMode(client, cfg);
   return terminalMode(client);
 }
