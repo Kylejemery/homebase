@@ -4,14 +4,21 @@ Work top-down. Each milestone should end with `npm run typecheck` clean and a
 manual test note added below it. Ask Kyle before adding new external services.
 
 ## M1 — Ship-ready quality on what exists (1 session)
-- [ ] Guided first-run setup: interactive prompts for Vapi keys + owner name/callback
+- [x] Guided first-run setup: interactive prompts for Vapi keys + owner name/callback
       (currently manual JSON editing)
-- [ ] `--version` and `--help` flags
-- [ ] Persist Telegram per-chat history to ~/.homebase/sessions.json (survive restarts)
-- [ ] Telegram allowlist: only respond to chat IDs the owner approves (first user to
+- [x] `--version` and `--help` flags
+- [x] Persist Telegram per-chat history to ~/.homebase/sessions.json (survive restarts)
+- [x] Telegram allowlist: only respond to chat IDs the owner approves (first user to
       message becomes owner; others need approval) — this is a privacy requirement
       before family use
-- [ ] Graceful handling when Anthropic API returns 429/529 (retry with backoff)
+- [x] Graceful handling when Anthropic API returns 429/529 (retry with backoff)
+
+**Manual test note (2026-07-06):** `npm run typecheck` clean. `--version`/`--help`
+verified to bypass config entirely. First-run setup smoke-tested end to end
+(prompts for API key, offers/declines Vapi setup, writes `setupComplete: true` to
+config.json) with a real `--task` call completing successfully. Telegram
+allowlist and session persistence are implemented but not yet tested live against
+the Telegram API (needs a bot token) — do that before family rollout.
 
 ## M2 — Real calendar + morning briefing (1–2 sessions)
 - [ ] Google Calendar integration via OAuth2 device flow (no browser redirect server):
