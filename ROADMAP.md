@@ -37,22 +37,43 @@ console.cloud.google.com, then run `homebase --google-auth`. Cron/Task Scheduler
 for the daily run is also still a user-side step.
 
 ## M3 — Call workflow polish (1 session)
-- [ ] Auto-followup: after make_phone_call, schedule a check (setTimeout in
+- [x] Auto-followup: after make_phone_call, schedule a check (setTimeout in
       interactive/telegram modes) and proactively message the outcome summary
-- [ ] Call log: persist call outcomes to ~/.homebase/calls.json; "what calls have you made?"
+- [x] Call log: persist call outcomes to ~/.homebase/calls.json; "what calls have you made?"
+      (check_phone_call with no call_id now returns the log)
 - [ ] Wire Vapi webhook alternative for instant results (optional server on Railway;
-      keep polling as the no-server default)
+      keep polling as the no-server default) — DEFERRED: new external service, needs
+      Kyle's sign-off per the rule above; polling default works
+
+**Manual test note (2026-07-06):** typecheck clean. Call log verified via earlier live
+test call. Auto-followup logic implemented (2-min poll, max 10 attempts, notifies the
+requesting chat); not yet exercised with a live call placed from telegram/interactive —
+verify on next real call.
 
 ## M4 — Model tiering (0.5 session)
-- [ ] Route trivial single-tool turns (list add/check) to Haiku; keep orchestrator on the
-      strong model. Config flag to disable. Mirror Arete router logic.
+- [x] Route trivial single-tool turns (list add/check) to Haiku; keep orchestrator on the
+      strong model. Config flag to disable (`"haikuRouting": false`). Mirror Arete router logic.
+
+**Manual test note (2026-07-06):** typecheck clean. `--task "add apples to the grocery
+list"` logged `⚡ routing trivial turn to claude-haiku-4-5` and completed correctly.
+Routing is a regex heuristic on the latest user message (list add/check/show patterns).
 
 ## M5 — The consulting demo (1–2 sessions) — HIGH VALUE
-- [ ] Build a standalone MCP server (`demo-medspa-mcp/`) exposing a fictional med spa's
-      booking calendar (list availability, book slot, cancel)
-- [ ] Add MCP client support to Homebase so it can consume that server as tools
-- [ ] End-to-end demo script: "book me a facial Thursday" → agent-to-agent booking, no phone call
+- [x] Build a standalone MCP server (`demo-medspa-mcp/`) exposing a fictional med spa's
+      booking calendar (list availability, book slot, cancel + list_services)
+- [x] Add MCP client support to Homebase so it can consume that server as tools
+      (generic: any `mcpServers` entry in config.json; tools appear as `<name>_<tool>`)
+- [x] End-to-end demo script: "book me a facial Thursday" → agent-to-agent booking, no phone call
+      (see demo-medspa-mcp/DEMO.md)
 - [ ] This becomes the "here's how AI assistants will book with your business" sales video
+      (video itself is Kyle's; the demo it records is done)
+
+**Manual test note (2026-07-06):** typecheck clean (script now covers server.ts too).
+Live end-to-end: agent connected to the spa server, listed availability, booked, cancelled,
+rebooked — including graceful recovery from a malformed slot format. Gotcha hit: MCP SDK
++ zod need a single zod copy — repo pins zod ^4.4.3 (SDK accepts ^3.25 || ^4). One model
+slip observed: "this Thursday" resolved to a Friday once — DEMO.md notes date-confirmation
+guidance for date-critical flows.
 
 ## M6 — iOS surface (later; separate repo)
 - React Native/Expo app: chat UI + push notifications, agent brain moves to Railway.
