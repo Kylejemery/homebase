@@ -1,0 +1,21 @@
+{
+  "name": "homebase",
+  "version": "0.1.0",
+  "description": "Distributable household logistics agent — compiles to a single executable",
+  "type": "module",
+  "scripts": {
+    "dev": "bun run homebase.ts",
+    "typecheck": "tsc --noEmit --strict --esModuleInterop --module nodenext --moduleResolution nodenext --target es2022 homebase.ts",
+    "build": "bun build --compile homebase.ts --outfile dist/homebase",
+    "build:mac": "bun build --compile --target=bun-darwin-arm64 homebase.ts --outfile dist/homebase-mac",
+    "build:win": "bun build --compile --target=bun-windows-x64 homebase.ts --outfile dist/homebase-win.exe",
+    "build:all": "bun run build:mac && bun run build:win"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.71.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.0",
+    "@types/node": "^24.0.0"
+  }
+}

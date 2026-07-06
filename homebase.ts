@@ -1,0 +1,620 @@
+/**
+ * HOMEBASE — a distributable household logistics agent
+ * =====================================================
+ * Compiles to a single executable. No installs needed on the target machine.
+ *
+ *   bun build --compile homebase.ts --outfile homebase
+ *
+ * Three ways to run it:
+ *   ./homebase                     interactive terminal chat
+ *   ./homebase --task "..."        one-shot task (for cron / Task Scheduler)
+ *   ./homebase --telegram          Telegram bot mode — your family texts the agent
+ *
+ * Capabilities (all local-first, zero external accounts required):
+ *   • Named lists      — grocery, todos, packing, anything ("add milk to grocery")
+ *   • Calendar         — add/list events, check a day, find conflicts
+ *   • Family memory    — remembers facts ("Nora's shoe size is 13T")
+ *   • Weather          — any city by name (Open-Meteo geocoding, no key)
+ *   • Local files      — list directories on this machine
+ *
+ * Data lives in ~/.homebase/ as plain JSON — inspectable, portable, private.
+ * First run asks for an Anthropic API key (stored locally; user pays own usage).
+ */
+
+import Anthropic from "@anthropic-ai/sdk";
+import * as fs from "fs";
+import * as path from "path";
+import * as readline from "readline";
+import * as os from "os";
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Storage — plain JSON files in ~/.homebase
+// ═══════════════════════════════════════════════════════════════════════════
+
+const DIR = path.join(os.homedir(), ".homebase");
+const FILE = (name: string) => path.join(DIR, `${name}.json`);
+
+function load<T>(name: string, fallback: T): T {
+  try {
+    return JSON.parse(fs.readFileSync(FILE(name), "utf-8"));
+  } catch {
+    return fallback;
+  }
+}
+function save(name: string, data: unknown) {
+  fs.mkdirSync(DIR, { recursive: true });
+  fs.writeFileSync(FILE(name), JSON.stringify(data, null, 2));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Config / API key
+// ═══════════════════════════════════════════════════════════════════════════
+
+interface Config {
+  apiKey?: string;
+  telegramBotToken?: string;
+  homeCity?: string;
+  vapiApiKey?: string;
+  vapiPhoneNumberId?: string;
+  ownerName?: string;
+  ownerCallback?: string;
+}
+
+function askOnce(question: string): Promise<string> {
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  return new Promise((res) =>
+    rl.question(question, (a) => {
+      rl.close();
+      res(a.trim());
+    })
+  );
+}
+
+async function getConfig(): Promise<Config> {
+  const cfg = load<Config>("config", {});
+  if (process.env.ANTHROPIC_API_KEY) cfg.apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!cfg.apiKey) {
+    cfg.apiKey = await askOnce("First run — paste your Anthropic API key: ");
+    save("config", cfg);
+    console.log(`Saved to ${FILE("config")}\n`);
+  }
+  return cfg;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Tools
+// ═══════════════════════════════════════════════════════════════════════════
+
+type Handler = (input: any) => Promise<string>;
+interface AgentTool {
+  schema: Anthropic.Tool;
+  handler: Handler;
+}
+
+// ── Named lists (grocery, todos, packing, ...) ─────────────────────────────
+
+type Lists = Record<string, { id: number; item: string; done: boolean }[]>;
+
+const listsTool: AgentTool = {
+  schema: {
+    name: "manage_lists",
+    description:
+      "Manage named household lists (e.g. 'grocery', 'todos', 'packing', 'hardware store'). " +
+      "Actions: 'show' one list or all lists, 'add' an item, 'check' (mark done) by id, " +
+      "'remove' by id, 'clear_done' to purge completed items from a list.",
+    input_schema: {
+      type: "object",
+      properties: {
+        action: { type: "string", enum: ["show", "add", "check", "remove", "clear_done"] },
+        list: { type: "string", description: "List name, lowercase. Omit with 'show' to see all lists." },
+        item: { type: "string", description: "Item text (for 'add')" },
+        id: { type: "number", description: "Item id (for 'check'/'remove')" },
+      },
+      required: ["action"],
+    },
+  },
+  handler: async (input) => {
+    const lists = load<Lists>("lists", {});
+    const name = input.list?.toLowerCase();
+    switch (input.action) {
+      case "show": {
+        if (!name) {
+          const names = Object.keys(lists);
+          return names.length
+            ? names.map((n) => `${n} (${lists[n].filter((i) => !i.done).length} open)`).join("\n")
+            : "No lists yet.";
+        }
+        const l = lists[name] ?? [];
+        return l.length
+          ? `${name}:\n` + l.map((i) => `  [${i.done ? "x" : " "}] #${i.id} ${i.item}`).join("\n")
+          : `'${name}' is empty.`;
+      }
+      case "add": {
+        lists[name] ??= [];
+        const id = (lists[name].at(-1)?.id ?? 0) + 1;
+        lists[name].push({ id, item: input.item, done: false });
+        save("lists", lists);
+        return `Added to ${name}: #${id} ${input.item}`;
+      }
+      case "check": {
+        const it = lists[name]?.find((i) => i.id === input.id);
+        if (!it) return `No #${input.id} in ${name}.`;
+        it.done = true;
+        save("lists", lists);
+        return `Checked off: ${it.item}`;
+      }
+      case "remove": {
+        const l = lists[name] ?? [];
+        const idx = l.findIndex((i) => i.id === input.id);
+        if (idx === -1) return `No #${input.id} in ${name}.`;
+        const [r] = l.splice(idx, 1);
+        save("lists", lists);
+        return `Removed: ${r.item}`;
+      }
+      case "clear_done": {
+        if (!lists[name]) return `No list '${name}'.`;
+        const before = lists[name].length;
+        lists[name] = lists[name].filter((i) => !i.done);
+        save("lists", lists);
+        return `Cleared ${before - lists[name].length} completed item(s) from ${name}.`;
+      }
+      default:
+        return "Unknown action.";
+    }
+  },
+};
+
+// ── Calendar (local event store) ───────────────────────────────────────────
+
+interface CalEvent {
+  id: number;
+  title: string;
+  start: string; // ISO datetime
+  end?: string;
+  who?: string;
+  notes?: string;
+}
+
+const calendarTool: AgentTool = {
+  schema: {
+    name: "manage_calendar",
+    description:
+      "The family calendar. Actions: 'add' an event, 'day' to see a specific date's events, " +
+      "'upcoming' for the next N days, 'remove' by id. When adding, resolve relative dates " +
+      "('Saturday', 'tomorrow') to ISO datetimes yourself using today's date. Also report any " +
+      "time conflicts you notice with existing events.",
+    input_schema: {
+      type: "object",
+      properties: {
+        action: { type: "string", enum: ["add", "day", "upcoming", "remove"] },
+        title: { type: "string" },
+        start: { type: "string", description: "ISO datetime, e.g. 2026-07-11T15:00" },
+        end: { type: "string", description: "ISO datetime (optional)" },
+        who: { type: "string", description: "Family member(s) involved (optional)" },
+        notes: { type: "string" },
+        date: { type: "string", description: "YYYY-MM-DD (for 'day')" },
+        days: { type: "number", description: "How many days ahead (for 'upcoming', default 7)" },
+        id: { type: "number", description: "Event id (for 'remove')" },
+      },
+      required: ["action"],
+    },
+  },
+  handler: async (input) => {
+    const events = load<CalEvent[]>("calendar", []);
+    const fmt = (e: CalEvent) => {
+      const d = new Date(e.start);
+      const when = d.toLocaleString("en-US", {
+        weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit",
+      });
+      return `#${e.id} ${when} — ${e.title}${e.who ? ` (${e.who})` : ""}${e.notes ? ` — ${e.notes}` : ""}`;
+    };
+    switch (input.action) {
+      case "add": {
+        const id = (events.at(-1)?.id ?? 0) + 1;
+        const ev: CalEvent = { id, title: input.title, start: input.start, end: input.end, who: input.who, notes: input.notes };
+        events.push(ev);
+        events.sort((a, b) => a.start.localeCompare(b.start));
+        save("calendar", events);
+        // naive conflict check: same calendar day, overlapping hour
+        const day = input.start.slice(0, 10);
+        const clashes = events.filter(
+          (e) => e.id !== id && e.start.slice(0, 10) === day &&
+            Math.abs(new Date(e.start).getTime() - new Date(input.start).getTime()) < 90 * 60 * 1000
+        );
+        return `Added: ${fmt(ev)}` + (clashes.length ? `\n⚠ Possible conflict with: ${clashes.map(fmt).join("; ")}` : "");
+      }
+      case "day": {
+        const dayEvents = events.filter((e) => e.start.slice(0, 10) === input.date);
+        return dayEvents.length ? dayEvents.map(fmt).join("\n") : `Nothing on ${input.date}.`;
+      }
+      case "upcoming": {
+        const now = new Date();
+        const horizon = new Date(now.getTime() + (input.days ?? 7) * 86400000);
+        const up = events.filter((e) => new Date(e.start) >= now && new Date(e.start) <= horizon);
+        return up.length ? up.map(fmt).join("\n") : "Nothing coming up.";
+      }
+      case "remove": {
+        const idx = events.findIndex((e) => e.id === input.id);
+        if (idx === -1) return `No event #${input.id}.`;
+        const [r] = events.splice(idx, 1);
+        save("calendar", events);
+        return `Removed: ${r.title}`;
+      }
+      default:
+        return "Unknown action.";
+    }
+  },
+};
+
+// ── Family memory (facts the agent should remember) ────────────────────────
+
+const memoryTool: AgentTool = {
+  schema: {
+    name: "family_memory",
+    description:
+      "Long-term memory for household facts: sizes, allergies, teacher names, wifi password locations, " +
+      "preferences, anything worth remembering. Actions: 'remember' (key + fact), 'recall' (search by " +
+      "keyword, or omit to see everything), 'forget' (by key). Proactively remember useful facts users mention.",
+    input_schema: {
+      type: "object",
+      properties: {
+        action: { type: "string", enum: ["remember", "recall", "forget"] },
+        key: { type: "string", description: "Short label, e.g. 'nora-shoe-size'" },
+        fact: { type: "string" },
+        query: { type: "string", description: "Keyword filter for 'recall'" },
+      },
+      required: ["action"],
+    },
+  },
+  handler: async (input) => {
+    const mem = load<Record<string, string>>("memory", {});
+    switch (input.action) {
+      case "remember":
+        mem[input.key] = input.fact;
+        save("memory", mem);
+        return `Remembered: ${input.key} = ${input.fact}`;
+      case "recall": {
+        const entries = Object.entries(mem).filter(
+          ([k, v]) => !input.query || (k + " " + v).toLowerCase().includes(input.query.toLowerCase())
+        );
+        return entries.length ? entries.map(([k, v]) => `${k}: ${v}`).join("\n") : "Nothing found.";
+      }
+      case "forget":
+        if (!(input.key in mem)) return `No memory '${input.key}'.`;
+        delete mem[input.key];
+        save("memory", mem);
+        return `Forgot ${input.key}.`;
+      default:
+        return "Unknown action.";
+    }
+  },
+};
+
+// ── Weather with geocoding (city name → forecast, no API key) ──────────────
+
+const weatherTool: AgentTool = {
+  schema: {
+    name: "get_weather",
+    description: "Current weather + today's high/low for any city, by name.",
+    input_schema: {
+      type: "object",
+      properties: { city: { type: "string", description: "e.g. 'Raleigh' or 'Raleigh, NC'" } },
+      required: ["city"],
+    },
+  },
+  handler: async (input) => {
+    const geo: any = await (
+      await fetch(`https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(input.city)}&count=1`)
+    ).json();
+    const place = geo.results?.[0];
+    if (!place) return `Couldn't find '${input.city}'.`;
+    const wx: any = await (
+      await fetch(
+        `https://api.open-meteo.com/v1/forecast?latitude=${place.latitude}&longitude=${place.longitude}` +
+          `&current=temperature_2m,precipitation,wind_speed_10m&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max` +
+          `&temperature_unit=fahrenheit&timezone=auto&forecast_days=1`
+      )
+    ).json();
+    const c = wx.current, d = wx.daily;
+    return (
+      `${place.name}, ${place.admin1 ?? place.country}: currently ${c.temperature_2m}°F, wind ${c.wind_speed_10m} km/h. ` +
+      `Today: high ${d.temperature_2m_max[0]}°F / low ${d.temperature_2m_min[0]}°F, ` +
+      `${d.precipitation_probability_max[0]}% chance of precipitation.`
+    );
+  },
+};
+
+// ── Local files ─────────────────────────────────────────────────────────────
+
+const filesTool: AgentTool = {
+  schema: {
+    name: "list_files",
+    description: "List files in a directory on this machine. '~' = home directory.",
+    input_schema: {
+      type: "object",
+      properties: { directory: { type: "string" } },
+      required: ["directory"],
+    },
+  },
+  handler: async (input) => {
+    const dir = input.directory.replace(/^~/, os.homedir());
+    try {
+      const entries = fs.readdirSync(dir, { withFileTypes: true });
+      return entries.slice(0, 60).map((e) => (e.isDirectory() ? e.name + "/" : e.name)).join("\n") || "(empty)";
+    } catch (err: any) {
+      return `Could not read ${dir}: ${err.message}`;
+    }
+  },
+};
+
+// ── Phone calls via Vapi (make appointments, check on service requests) ────
+//
+// Requires in ~/.homebase/config.json:
+//   "vapiApiKey":        from dashboard.vapi.ai
+//   "vapiPhoneNumberId": a phone number in your Vapi account (free Vapi number or imported Twilio)
+//   "ownerName":         who the agent is calling on behalf of, e.g. "Kyle"
+//   "ownerCallback":     callback number to leave in voicemails, e.g. "+19195551234"
+//
+// The voice assistant is created transiently per call with a briefing, and has
+// Vapi's built-in dtmf tool — so it can navigate "press 2 for appointments"
+// menus — plus endCall, and instructions for voicemail and graceful escalation.
+
+function vapiCfg(): Config {
+  return load<Config>("config", {});
+}
+
+const CALL_AGENT_PROMPT = (briefing: string, cfg: Config) => `
+You are a polite, efficient phone assistant calling on behalf of ${cfg.ownerName ?? "your client"}.
+
+YOUR TASK:
+${briefing}
+
+RULES:
+- At the start of a human conversation, disclose naturally: "Hi, I'm an AI assistant calling on behalf of ${cfg.ownerName ?? "my client"}."
+- Only share information included in your task briefing. If asked for anything else (SSN, payment details, medical history not in the briefing), say ${cfg.ownerName ?? "they"} will provide that directly, and offer the callback number.
+- IVR MENUS: If you reach an automated menu, listen to ALL the options before acting. Then use the dtmf tool to press the right key. Send digits slowly with pauses (e.g. "1w2" not "12"). If tones don't register after two tries, SAY the option number out loud instead.
+- HOLD: If placed on hold, wait patiently and silently.
+- VOICEMAIL: If you reach voicemail, leave a brief message: who you're calling for, the purpose, and the callback number ${cfg.ownerCallback ?? "(none provided — just say they'll call back)"}. Then use endCall.
+- If the office requires ${cfg.ownerName ?? "the client"} personally, don't push. Ask what they'll need when calling back, thank them, and end the call.
+- When your task is complete or clearly cannot be completed, summarize the outcome verbally ("Great, so that's confirmed for...") then use endCall.
+- Be warm and brief. Receptionists are busy.
+`.trim();
+
+const phoneCallTool: AgentTool = {
+  schema: {
+    name: "make_phone_call",
+    description:
+      "Place a real phone call via an AI voice agent (Vapi). Use for booking appointments, checking on " +
+      "service requests, asking a business a question, etc. Provide the number in E.164 format (+1...) and a " +
+      "COMPLETE briefing: purpose, what info may be shared (name, DOB, insurance if relevant), " +
+      "acceptable outcomes (e.g. availability windows for appointments), and what to do on voicemail. " +
+      "ALWAYS confirm the briefing and number with the user before calling. Returns a call id — check the " +
+      "outcome later with check_phone_call.",
+    input_schema: {
+      type: "object",
+      properties: {
+        phone_number: { type: "string", description: "E.164, e.g. +19195551234" },
+        briefing: { type: "string", description: "Complete task briefing for the voice agent" },
+        first_message: {
+          type: "string",
+          description: "Opening line if a human answers, e.g. \"Hi! I'm an AI assistant calling on behalf of Kyle...\"",
+        },
+      },
+      required: ["phone_number", "briefing"],
+    },
+  },
+  handler: async (input) => {
+    const cfg = vapiCfg();
+    if (!cfg.vapiApiKey || !cfg.vapiPhoneNumberId)
+      return "Phone calling isn't configured. Add vapiApiKey and vapiPhoneNumberId to " + FILE("config");
+    const res = await fetch("https://api.vapi.ai/call", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${cfg.vapiApiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        phoneNumberId: cfg.vapiPhoneNumberId,
+        customer: { number: input.phone_number },
+        assistant: {
+          firstMessageMode: "assistant-waits-for-user", // let them say "Doctor's office, how can I help?"
+          firstMessage: input.first_message,
+          model: {
+            provider: "anthropic",
+            model: "claude-sonnet-4-5",
+            messages: [{ role: "system", content: CALL_AGENT_PROMPT(input.briefing, cfg) }],
+            tools: [{ type: "dtmf" }, { type: "endCall" }],
+          },
+          voicemailDetection: { provider: "twilio" },
+          maxDurationSeconds: 900,
+        },
+      }),
+    });
+    const data: any = await res.json();
+    if (!res.ok) return `Call failed to start: ${JSON.stringify(data)}`;
+    return `Call placed (id: ${data.id}). Dialing ${input.phone_number} now. Use check_phone_call in a few minutes to get the outcome.`;
+  },
+};
+
+const checkCallTool: AgentTool = {
+  schema: {
+    name: "check_phone_call",
+    description:
+      "Check the status/outcome of a phone call placed with make_phone_call. Returns status, summary, " +
+      "and transcript when the call has ended.",
+    input_schema: {
+      type: "object",
+      properties: { call_id: { type: "string" } },
+      required: ["call_id"],
+    },
+  },
+  handler: async (input) => {
+    const cfg = vapiCfg();
+    if (!cfg.vapiApiKey) return "Phone calling isn't configured.";
+    const res = await fetch(`https://api.vapi.ai/call/${input.call_id}`, {
+      headers: { Authorization: `Bearer ${cfg.vapiApiKey}` },
+    });
+    const data: any = await res.json();
+    if (!res.ok) return `Lookup failed: ${JSON.stringify(data)}`;
+    if (data.status !== "ended")
+      return `Call status: ${data.status}. Not finished yet — check again shortly.`;
+    const summary = data.analysis?.summary ?? data.summary ?? "(no summary)";
+    const transcript = (data.transcript ?? "").slice(0, 3000);
+    return `Call ended (${data.endedReason ?? "unknown reason"}).\nSUMMARY: ${summary}\n\nTRANSCRIPT:\n${transcript}`;
+  },
+};
+
+const TOOLS: AgentTool[] = [
+  listsTool, calendarTool, memoryTool, weatherTool, filesTool, phoneCallTool, checkCallTool,
+];
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Agent loop
+// ═══════════════════════════════════════════════════════════════════════════
+
+const SYSTEM_PROMPT = `You are Homebase, a household logistics agent running locally on the family's own machine.
+Today is ${new Date().toDateString()} (${new Date().toISOString().slice(0, 10)}).
+Resolve relative dates ("Saturday", "tomorrow") to ISO datetimes yourself before calling calendar tools.
+Proactively store useful facts in family_memory when people mention them.
+Be concise and practical — you're texting busy parents, not writing essays.
+PHONE CALLS: you can place real calls with make_phone_call. Before calling, ALWAYS confirm with the user:
+the number, the goal, and exactly what personal info you may share (pull known facts from family_memory,
+ask for anything missing like DOB or insurance if the task needs it). After placing a call, tell the user
+you'll check back — then use check_phone_call when they ask, or on your next scheduled run.`;
+
+async function runAgentTurn(client: Anthropic, history: Anthropic.MessageParam[], log = true): Promise<string> {
+  while (true) {
+    const response = await client.messages.create({
+      model: "claude-sonnet-4-5",
+      max_tokens: 1024,
+      system: SYSTEM_PROMPT,
+      tools: TOOLS.map((t) => t.schema),
+      messages: history,
+    });
+    history.push({ role: "assistant", content: response.content });
+
+    if (response.stop_reason !== "tool_use") {
+      return response.content
+        .filter((b): b is Anthropic.TextBlock => b.type === "text")
+        .map((b) => b.text)
+        .join("\n");
+    }
+
+    const results: Anthropic.ToolResultBlockParam[] = [];
+    for (const block of response.content) {
+      if (block.type !== "tool_use") continue;
+      if (log) console.log(`  ⚙ ${block.name}(${JSON.stringify(block.input)})`);
+      const tool = TOOLS.find((t) => t.schema.name === block.name);
+      let out: string;
+      try {
+        out = tool ? await tool.handler(block.input) : `Unknown tool ${block.name}`;
+      } catch (err: any) {
+        out = `Tool error: ${err.message}`;
+      }
+      results.push({ type: "tool_result", tool_use_id: block.id, content: out });
+    }
+    history.push({ role: "user", content: results });
+  }
+}
+
+// Trim history so long-running Telegram sessions don't grow unboundedly
+function trimHistory(history: Anthropic.MessageParam[], maxMessages = 40) {
+  while (history.length > maxMessages) history.shift();
+  // never start history on a tool_result turn
+  while (history.length && Array.isArray(history[0].content) &&
+         (history[0].content as any[])[0]?.type === "tool_result") {
+    history.shift();
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Mode 1: interactive terminal chat
+// ═══════════════════════════════════════════════════════════════════════════
+
+async function terminalMode(client: Anthropic) {
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  const history: Anthropic.MessageParam[] = [];
+  console.log("Homebase ready. ('quit' to exit)\n");
+  const ask = () =>
+    rl.question("you > ", async (line) => {
+      const text = line.trim();
+      if (!text) return ask();
+      if (text.toLowerCase() === "quit") return rl.close();
+      history.push({ role: "user", content: text });
+      try {
+        console.log(`\nhomebase > ${await runAgentTurn(client, history)}\n`);
+      } catch (err: any) {
+        console.error(`Error: ${err.message}\n`);
+      }
+      trimHistory(history);
+      ask();
+    });
+  ask();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Mode 2: one-shot task (for cron / Task Scheduler)
+//   ./homebase --task "text me anything on the calendar today and the weather"
+// ═══════════════════════════════════════════════════════════════════════════
+
+async function taskMode(client: Anthropic, task: string) {
+  const history: Anthropic.MessageParam[] = [{ role: "user", content: task }];
+  console.log(await runAgentTurn(client, history));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Mode 3: Telegram bot — the family texts the agent
+//   Setup: message @BotFather on Telegram, /newbot, paste the token on first run.
+//   No public server needed — long polling works from behind any home router.
+// ═══════════════════════════════════════════════════════════════════════════
+
+async function telegramMode(client: Anthropic, cfg: Config) {
+  if (!cfg.telegramBotToken) {
+    cfg.telegramBotToken = await askOnce("Paste your Telegram bot token (from @BotFather): ");
+    save("config", cfg);
+  }
+  const api = (method: string, params: any = {}) =>
+    fetch(`https://api.telegram.org/bot${cfg.telegramBotToken}/${method}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(params),
+    }).then((r) => r.json() as any);
+
+  const sessions = new Map<number, Anthropic.MessageParam[]>();
+  let offset = 0;
+  console.log("Homebase is live on Telegram. Ctrl-C to stop.");
+
+  while (true) {
+    const updates: any = await api("getUpdates", { offset, timeout: 30 });
+    for (const u of updates.result ?? []) {
+      offset = u.update_id + 1;
+      const msg = u.message;
+      if (!msg?.text) continue;
+      const chatId = msg.chat.id;
+      const history = sessions.get(chatId) ?? [];
+      sessions.set(chatId, history);
+      history.push({ role: "user", content: `[from ${msg.from?.first_name ?? "family member"}] ${msg.text}` });
+      try {
+        const reply = await runAgentTurn(client, history, false);
+        trimHistory(history);
+        await api("sendMessage", { chat_id: chatId, text: reply });
+      } catch (err: any) {
+        await api("sendMessage", { chat_id: chatId, text: `Error: ${err.message}` });
+      }
+    }
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Entry
+// ═══════════════════════════════════════════════════════════════════════════
+
+async function main() {
+  const cfg = await getConfig();
+  const client = new Anthropic({ apiKey: cfg.apiKey });
+  const args = process.argv.slice(2);
+
+  const taskIdx = args.indexOf("--task");
+  if (taskIdx !== -1 && args[taskIdx + 1]) return taskMode(client, args[taskIdx + 1]);
+  if (args.includes("--telegram")) return telegramMode(client, cfg);
+  return terminalMode(client);
+}
+
+main();
