@@ -1108,7 +1108,29 @@ function readBody(req: http.IncomingMessage): Promise<string> {
   });
 }
 
+// Merge secrets from env (Railway service variables) into the config so the
+// file-reading tools (Vapi, Google) work without a config.json on the box.
+function hydrateConfigFromEnv(cfg: Config) {
+  const map: [keyof Config, string | undefined][] = [
+    ["vapiApiKey", process.env.VAPI_API_KEY],
+    ["vapiPhoneNumberId", process.env.VAPI_PHONE_NUMBER_ID],
+    ["ownerName", process.env.OWNER_NAME],
+    ["ownerCallback", process.env.OWNER_CALLBACK],
+    ["homeCity", process.env.HOME_CITY],
+    ["googleClientId", process.env.GOOGLE_CLIENT_ID],
+    ["googleClientSecret", process.env.GOOGLE_CLIENT_SECRET],
+  ];
+  let dirty = false;
+  for (const [k, v] of map) if (v && (cfg as any)[k] !== v) { (cfg as any)[k] = v; dirty = true; }
+  // Google OAuth tokens as a JSON blob (copy from a local `--google-auth` run).
+  if (process.env.GOOGLE_TOKENS && !cfg.googleTokens) {
+    try { cfg.googleTokens = JSON.parse(process.env.GOOGLE_TOKENS); dirty = true; } catch {}
+  }
+  if (dirty) save("config", cfg);
+}
+
 async function serveMode(client: Anthropic, cfg: Config, port: number) {
+  hydrateConfigFromEnv(cfg);
   let token = process.env.HOMEBASE_SERVER_TOKEN || cfg.serverToken;
   if (!token) {
     token = randomUUID();
