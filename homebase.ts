@@ -30,6 +30,7 @@ import * as readline from "readline";
 import * as os from "os";
 import * as http from "http";
 import { exec } from "child_process";
+import { randomUUID } from "crypto";
 
 // Keep in sync with package.json
 const VERSION = "0.1.0";
@@ -42,6 +43,7 @@ Usage:
   homebase --task morning-briefing   preset: today's events + weather + open lists
   homebase --to-telegram         with --task: deliver output to the owner's Telegram chat
   homebase --telegram            Telegram bot mode — family texts the agent
+  homebase --serve               HTTP brain for the mobile app (PORT env or 8080)
   homebase --google-auth         connect Google Calendar (one-time OAuth in your browser)
   homebase --version, -v         print version
   homebase --help, -h            show this help
@@ -53,7 +55,9 @@ Data lives in ~/.homebase/ as plain JSON. First run walks through setup
 // Storage — plain JSON files in ~/.homebase
 // ═══════════════════════════════════════════════════════════════════════════
 
-const DIR = path.join(os.homedir(), ".homebase");
+// HOMEBASE_DIR lets the hosted (Railway) brain point storage at a persistent
+// volume; locally it defaults to ~/.homebase. Same JSON-file model either way.
+const DIR = process.env.HOMEBASE_DIR || path.join(os.homedir(), ".homebase");
 const FILE = (name: string) => path.join(DIR, `${name}.json`);
 
 function load<T>(name: string, fallback: T): T {
@@ -89,6 +93,7 @@ interface Config {
   googleTokens?: { access_token: string; refresh_token?: string; expires_at?: number };
   haikuRouting?: boolean; // false disables fast-model routing of trivial turns
   mcpServers?: { name: string; command: string; args?: string[] }[];
+  serverToken?: string; // shared secret the mobile app sends to the --serve brain
 }
 
 function askOnce(question: string): Promise<string> {
@@ -101,9 +106,16 @@ function askOnce(question: string): Promise<string> {
   );
 }
 
-async function getConfig(): Promise<Config> {
+async function getConfig(interactive = true): Promise<Config> {
   const cfg = load<Config>("config", {});
   if (process.env.ANTHROPIC_API_KEY) cfg.apiKey = process.env.ANTHROPIC_API_KEY;
+
+  // Non-interactive (hosted --serve on Railway): never prompt. Secrets come from
+  // env vars; the local JSON file (if any, e.g. on a volume) fills in the rest.
+  if (!interactive) {
+    if (!cfg.apiKey) throw new Error("ANTHROPIC_API_KEY not set (required in --serve mode).");
+    return cfg;
+  }
 
   if (!cfg.setupComplete) {
     console.log("Welcome to Homebase — first-run setup.\n");
@@ -1076,6 +1088,88 @@ async function telegramMode(client: Anthropic, cfg: Config) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Mode 4: HTTP server — the "brain" the mobile app (M6) talks to
+//   ./homebase --serve            (PORT env or 8080)
+//
+// Reuses every tool and the same agent loop as the other modes. Auth is a shared
+// bearer token (env HOMEBASE_SERVER_TOKEN, else config.serverToken, else a
+// generated one printed at startup). Sessions persist to the storage dir so a
+// Railway redeploy with a volume keeps history. Endpoints:
+//   GET  /health                       → { ok, version }         (no auth)
+//   POST /chat  { sessionId, message } → { reply }
+//   POST /register-push { sessionId, pushToken } → { ok }        (push comes later)
+// ═══════════════════════════════════════════════════════════════════════════
+
+function readBody(req: http.IncomingMessage): Promise<string> {
+  return new Promise((resolve) => {
+    let data = "";
+    req.on("data", (c) => (data += c));
+    req.on("end", () => resolve(data));
+  });
+}
+
+async function serveMode(client: Anthropic, cfg: Config, port: number) {
+  let token = process.env.HOMEBASE_SERVER_TOKEN || cfg.serverToken;
+  if (!token) {
+    token = randomUUID();
+    cfg.serverToken = token;
+    save("config", cfg);
+  }
+
+  const sessions = new Map<string, Anthropic.MessageParam[]>(
+    Object.entries(load<StoredSessions>("sessions", {}))
+  );
+  const saveSessions = () => save("sessions", Object.fromEntries(sessions));
+
+  const server = http.createServer(async (req, res) => {
+    const send = (code: number, obj: unknown) => {
+      res.writeHead(code, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Headers": "authorization,content-type" });
+      res.end(JSON.stringify(obj));
+    };
+    try {
+      const url = new URL(req.url ?? "/", "http://localhost");
+      if (req.method === "OPTIONS") return send(204, {});
+      if (req.method === "GET" && url.pathname === "/health") return send(200, { ok: true, version: VERSION });
+
+      if ((req.headers.authorization ?? "") !== `Bearer ${token}`) return send(401, { error: "unauthorized" });
+
+      if (req.method === "POST" && url.pathname === "/chat") {
+        const { sessionId = "default", message } = JSON.parse((await readBody(req)) || "{}");
+        if (!message || typeof message !== "string") return send(400, { error: "message (string) required" });
+        const history = sessions.get(sessionId) ?? [];
+        sessions.set(sessionId, history);
+        history.push({ role: "user", content: message });
+        const reply = await runAgentTurn(client, history, false);
+        trimHistory(history);
+        saveSessions();
+        scheduleCallFollowups((t) => { const h = sessions.get(sessionId); if (h) { h.push({ role: "assistant", content: t }); saveSessions(); } });
+        return send(200, { reply });
+      }
+
+      if (req.method === "POST" && url.pathname === "/register-push") {
+        const { sessionId = "default", pushToken } = JSON.parse((await readBody(req)) || "{}");
+        if (!pushToken) return send(400, { error: "pushToken required" });
+        const tokens = load<Record<string, string>>("push", {});
+        tokens[sessionId] = pushToken;
+        save("push", tokens);
+        return send(200, { ok: true });
+      }
+
+      return send(404, { error: "not found" });
+    } catch (err: any) {
+      send(500, { error: err.message });
+    }
+  });
+
+  server.listen(port, () => {
+    console.log(`Homebase brain serving on :${port}`);
+    console.log(`  health:  GET  /health`);
+    console.log(`  chat:    POST /chat  { sessionId, message }  (Bearer ${token})`);
+    if (!process.env.HOMEBASE_SERVER_TOKEN) console.log(`\n  Auth token (set as HOMEBASE_SERVER_TOKEN on the app + Railway): ${token}`);
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Entry
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -1093,9 +1187,15 @@ async function main() {
 
   if (args.includes("--google-auth")) return googleConnect();
 
-  const cfg = await getConfig();
+  const serve = args.includes("--serve");
+  const cfg = await getConfig(!serve); // non-interactive in serve mode (no stdin on Railway)
   const client = new Anthropic({ apiKey: cfg.apiKey });
   TOOLS.push(...(await connectMcpServers()));
+
+  if (serve) {
+    const port = Number(process.env.PORT) || 8080;
+    return serveMode(client, cfg, port);
+  }
 
   const taskIdx = args.indexOf("--task");
   if (taskIdx !== -1 && args[taskIdx + 1]) {
