@@ -78,9 +78,34 @@ rebooked — including graceful recovery from a malformed slot format. Gotcha hi
 slip observed: "this Thursday" resolved to a Friday once — DEMO.md notes date-confirmation
 guidance for date-critical flows.
 
-## M6 — iOS surface (later; separate repo)
-- React Native/Expo app: chat UI + push notifications, agent brain moves to Railway.
-  Architecture sibling of arete-app. Do not start until M1–M3 are done.
+## M6 — iOS surface (separate repo: ../homebase-app)
+- [x] Agent brain as an HTTP server: `homebase --serve` (health/chat/register-push,
+      bearer-token auth, sessions persisted). Reuses every tool + the agent loop.
+- [x] React Native/Expo app (`homebase-app`, Expo SDK 57): chat UI + connection gate,
+      talks to the brain; registers for push. Bundles + typechecks clean.
+- [x] Railway-ready: `railway.json`, env-hydrated secrets (no config.json needed on the
+      box), `HOMEBASE_DIR` → volume. See DEPLOY.md.
+- [x] Push delivery: `sendExpoPush` + `--to-push` so the morning briefing reaches the app.
+- [x] Family auth: shared bearer token (`HOMEBASE_SERVER_TOKEN`) — same secret on the
+      phone (Connect screen) and Railway.
+
+**Manual test note (2026-07-07):** brain `--serve` tested live (health, 401 without token,
+authed chat, session continuity, register-push). Railway path simulated with a fresh
+volume + env-only secrets: server starts on $PORT, hydrates secrets to the volume config.
+App typechecks + bundles clean (web bundle 2.1MB, no resolution errors). Expo push payload
+validated against exp.host (correct shape; DeviceNotRegistered on a fake token as expected).
+
+**Needs Kyle (accounts/hardware — can't be automated):**
+- Deploy the brain: railway.app → deploy `Kylejemery/homebase` → volume at /data → set env
+  vars from DEPLOY.md → generate domain.
+- On-device test: `bunx expo start` in homebase-app, scan with Expo Go, enter the Railway
+  domain + token on the Connect screen. For push + TestFlight, `eas init` then an EAS build.
+
+## Non-goals (for now)
+- Multi-tenant/cloud version (local-first is still the CLI product's identity; the Railway
+  brain is single-family, not a SaaS)
+- Windows code signing (revisit if a client needs it)
+- Local LLM fallback
 
 ## Non-goals (for now)
 - Multi-tenant/cloud version (local-first is the product's identity)
