@@ -31,10 +31,13 @@ the Telegram API (needs a bot token) — do that before family rollout.
 
 **Manual test note (2026-07-06):** typecheck clean. `--task morning-briefing --to-telegram`
 tested live: agent tried Google Calendar (graceful "not connected" fallback), read local
-calendar + memory + lists, and the briefing arrived in Kyle's Telegram chat. Google OAuth
-itself not yet exercised — needs Kyle to create the OAuth client (Desktop app) in
-console.cloud.google.com, then run `homebase --google-auth`. Cron/Task Scheduler entry
-for the daily run is also still a user-side step.
+calendar + memory + lists, and the briefing arrived in Kyle's Telegram chat.
+
+**Google OAuth verified live (2026-07-07):** Kyle created a Desktop-app OAuth client,
+ran `homebase --google-auth`, approved the calendar.events scope through the loopback
+flow; access + refresh tokens saved to ~/.homebase/config.json. Full read+write
+round-trip confirmed (added an event to the real primary calendar, listed it back,
+deleted it). Remaining user-side step: Task Scheduler entry for the daily briefing.
 
 ## M3 — Call workflow polish (1 session)
 - [x] Auto-followup: after make_phone_call, schedule a check (setTimeout in
