@@ -42,6 +42,7 @@ Usage:
   homebase --task "..."          one-shot task (for cron / Task Scheduler)
   homebase --task morning-briefing   preset: today's events + weather + open lists
   homebase --to-telegram         with --task: deliver output to the owner's Telegram chat
+  homebase --to-push             with --task: push output to the mobile app (registered devices)
   homebase --telegram            Telegram bot mode — family texts the agent
   homebase --serve               HTTP brain for the mobile app (PORT env or 8080)
   homebase --google-auth         connect Google Calendar (one-time OAuth in your browser)
@@ -966,10 +967,30 @@ const MORNING_BRIEFING_TASK = (cfg: Config) =>
 3. Open items across all lists (skip empty ones).
 Format it as one friendly, compact message with short sections — it's going to a family group chat.`;
 
-async function taskMode(client: Anthropic, cfg: Config, task: string, toTelegram: boolean) {
-  if (task === "morning-briefing") task = MORNING_BRIEFING_TASK(cfg);
+// Deliver a message to every phone that registered via /register-push. Expo's
+// push API needs no key for sends; returns per-message tickets. Used by the
+// morning briefing (and available for call followups) so the app gets notified.
+async function sendExpoPush(title: string, body: string): Promise<string> {
+  const tokens = Object.values(load<Record<string, string>>("push", {}));
+  if (!tokens.length) return "No registered push tokens.";
+  const messages = tokens.map((to) => ({ to, title, body, sound: "default" }));
+  const res = await fetch("https://exp.host/--/api/v2/push/send", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify(messages),
+  });
+  const data: any = await res.json().catch(() => ({}));
+  if (!res.ok) return `Push failed: ${JSON.stringify(data)}`;
+  const errors = (data.data ?? []).filter((t: any) => t.status === "error");
+  return `Pushed to ${tokens.length} device(s)${errors.length ? `, ${errors.length} error(s): ${JSON.stringify(errors)}` : ""}.`;
+}
+
+async function taskMode(client: Anthropic, cfg: Config, task: string, toTelegram: boolean, toPush: boolean) {
+  const isBriefing = task === "morning-briefing";
+  if (isBriefing) task = MORNING_BRIEFING_TASK(cfg);
   const history: Anthropic.MessageParam[] = [{ role: "user", content: task }];
   const result = await runAgentTurn(client, history);
+  let delivered = false;
   if (toTelegram && cfg.telegramBotToken && cfg.telegramOwnerChatId) {
     const res: any = await fetch(`https://api.telegram.org/bot${cfg.telegramBotToken}/sendMessage`, {
       method: "POST",
@@ -977,7 +998,13 @@ async function taskMode(client: Anthropic, cfg: Config, task: string, toTelegram
       body: JSON.stringify({ chat_id: cfg.telegramOwnerChatId, text: result }),
     }).then((r) => r.json());
     console.log(res.ok ? "Delivered to Telegram." : `Telegram delivery failed: ${JSON.stringify(res)}`);
-  } else {
+    delivered = true;
+  }
+  if (toPush) {
+    console.log(await sendExpoPush(isBriefing ? "Morning briefing" : "Homebase", result));
+    delivered = true;
+  }
+  if (!delivered) {
     if (toTelegram) console.error("(--to-telegram needs telegramBotToken + an owner chat — printing instead)");
     console.log(result);
   }
@@ -1221,7 +1248,7 @@ async function main() {
 
   const taskIdx = args.indexOf("--task");
   if (taskIdx !== -1 && args[taskIdx + 1]) {
-    await taskMode(client, cfg, args[taskIdx + 1], args.includes("--to-telegram"));
+    await taskMode(client, cfg, args[taskIdx + 1], args.includes("--to-telegram"), args.includes("--to-push"));
     process.exit(0); // MCP child processes would otherwise keep the event loop alive
   }
   if (args.includes("--telegram")) return telegramMode(client, cfg);
