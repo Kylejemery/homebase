@@ -1,0 +1,7 @@
+node_modules
+dist
+.git
+.omc
+.claude
+*.md
+demo-medspa-mcp/bookings.json
