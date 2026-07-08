@@ -99,6 +99,7 @@ interface Config {
   briefingTimezone?: string; // IANA tz for briefingTime (default America/New_York)
   debriefTime?: string; // "HH:MM" — afternoon debrief (default 16:30)
   reflectionTime?: string; // "HH:MM" — silent nightly habit-learning pass (default 21:30)
+  nudgeTime?: string; // "HH:MM" — evening look-ahead nudge, silent when nothing's notable (default 20:00)
   twilioAccountSid?: string;
   twilioAuthToken?: string;
   twilioFromNumber?: string; // E.164 — the agent's own number
@@ -625,6 +626,10 @@ const gmailTool: AgentTool = {
       properties: {
         hours: { type: "number", description: "Look-back window in hours (default 24)" },
         query: { type: "string", description: "Extra Gmail search filter, e.g. 'from:school.org' (optional)" },
+        detail: {
+          type: "boolean",
+          description: "true = include message bodies (needed to extract dates/times/addresses); default false = snippets only",
+        },
       },
       required: [],
     },
@@ -636,7 +641,7 @@ const gmailTool: AgentTool = {
     const q = `in:inbox -category:promotions -category:social newer_than:${Math.max(1, Math.ceil(hours / 24))}d${input.query ? ` ${input.query}` : ""}`;
     const list: any = await (
       await fetch(
-        `https://gmail.googleapis.com/gmail/v1/users/me/messages?` + new URLSearchParams({ q, maxResults: "15" }),
+        `https://gmail.googleapis.com/gmail/v1/users/me/messages?` + new URLSearchParams({ q, maxResults: input.detail ? "8" : "15" }),
         { headers: { Authorization: `Bearer ${token}` } }
       )
     ).json();
@@ -649,19 +654,43 @@ const gmailTool: AgentTool = {
     if (!ids.length) return "No inbox emails in that window.";
     const rows: string[] = [];
     for (const id of ids) {
+      const format = input.detail ? "full" : "metadata&metadataHeaders=From&metadataHeaders=Subject";
       const msg: any = await (
-        await fetch(
-          `https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}?format=metadata&metadataHeaders=From&metadataHeaders=Subject`,
-          { headers: { Authorization: `Bearer ${token}` } }
-        )
+        await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}?format=${format}`, {
+          headers: { Authorization: `Bearer ${token}` },
+        })
       ).json();
-      const h = (name: string) => msg.payload?.headers?.find((x: any) => x.name === name)?.value ?? "";
+      const h = (name: string) => msg.payload?.headers?.find((x: any) => x.name.toLowerCase() === name.toLowerCase())?.value ?? "";
       const from = h("From").replace(/<.*>/, "").trim();
-      rows.push(`FROM ${from} — ${h("Subject")}${msg.snippet ? ` — ${msg.snippet.slice(0, 140)}` : ""}`);
+      let line = `FROM ${from} — ${h("Subject")}`;
+      if (input.detail) {
+        const body = gmailPlainText(msg.payload).replace(/\s+/g, " ").slice(0, 1500);
+        line += `\n  ${body || msg.snippet || "(no text)"}`;
+      } else if (msg.snippet) {
+        line += ` — ${msg.snippet.slice(0, 140)}`;
+      }
+      rows.push(line);
     }
     return rows.join("\n");
   },
 };
+
+// Walk a Gmail payload tree for the first text/plain part (base64url-encoded).
+function gmailPlainText(payload: any): string {
+  if (!payload) return "";
+  if (payload.mimeType === "text/plain" && payload.body?.data) {
+    try {
+      return Buffer.from(payload.body.data.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf-8");
+    } catch {
+      return "";
+    }
+  }
+  for (const part of payload.parts ?? []) {
+    const t = gmailPlainText(part);
+    if (t) return t;
+  }
+  return "";
+}
 
 // ── SMS via Twilio — the agent texts family members or anyone else ──────────
 
@@ -1079,6 +1108,23 @@ const AFTERNOON_DEBRIEF_TASK = (cfg: Config) =>
 Check family_memory for 'habit' entries and tailor accordingly.
 Keep it brief and warm — this is the "how'd today go, what's tomorrow" message.`;
 
+// Evening look-ahead: heads-up ONLY when something warrants it — otherwise
+// reply exactly NOTHING and no notification goes out. Also the email→calendar
+// bridge: proposes found events, never adds them without the user confirming.
+const NUDGE_TASK = (cfg: Config) =>
+  `You are doing the evening look-ahead scan. Check, in order:
+1. TOMORROW's calendar (Google if connected, plus local): anything unusually early (before 9am),
+   overlapping/back-to-back events, or events that clearly need prep tonight.
+2. Recent emails if Gmail is connected (gmail_summary with detail:true, last 48h): concrete
+   events with dates/times (school events, appointments, invitations, deliveries needing someone
+   home) that are NOT already on the calendar. List each as a proposal:
+   "📩 From your email: <event> — <date/time>. Want it on the calendar? Just reply here."
+   NEVER add calendar events yourself during this scan — only propose.
+3. family_memory 'habit' entries vs tomorrow: conflicts with known routines.
+RULES: Be selective — a nudge that fires nightly gets ignored. If NOTHING genuinely warrants a
+heads-up, reply with exactly the single word: NOTHING
+Otherwise reply with the nudge message only (short, friendly, actionable)${cfg.ownerName ? ` — it goes to ${cfg.ownerName}'s family` : ""}.`;
+
 // Nightly, silent: review today's conversations and persist durable habits so
 // briefings get smarter over time. The agent writes via family_memory itself.
 const REFLECTION_TASK = (transcript: string) =>
@@ -1275,6 +1321,7 @@ function hydrateConfigFromEnv(cfg: Config) {
     ["briefingTimezone", process.env.BRIEFING_TZ],
     ["debriefTime", process.env.DEBRIEF_TIME],
     ["reflectionTime", process.env.REFLECTION_TIME],
+    ["nudgeTime", process.env.NUDGE_TIME],
     ["twilioAccountSid", process.env.TWILIO_ACCOUNT_SID],
     ["twilioAuthToken", process.env.TWILIO_AUTH_TOKEN],
     ["twilioFromNumber", process.env.TWILIO_FROM_NUMBER],
@@ -1336,6 +1383,29 @@ async function runBriefingAndDeliver(client: Anthropic, kind: "morning" | "debri
     report.push(r.ok ? "Telegram delivered." : `Telegram failed: ${JSON.stringify(r)}`);
   }
   return report.join(" ");
+}
+
+// Evening nudge: runs the look-ahead scan; delivers only when the agent found
+// something (the NOTHING sentinel suppresses delivery entirely — no noise).
+async function runNudgeAndDeliver(client: Anthropic): Promise<string> {
+  const cfg = load<Config>("config", {});
+  const pushCount = Object.keys(load<Record<string, string>>("push", {})).length;
+  const hasTelegram = !!(cfg.telegramBotToken && cfg.telegramOwnerChatId);
+  if (!pushCount && !hasTelegram) return "Skipped: no delivery targets.";
+  const history: Anthropic.MessageParam[] = [{ role: "user", content: NUDGE_TASK(cfg) }];
+  const result = (await runAgentTurn(client, history, false)).trim();
+  if (/^NOTHING\b/i.test(result)) return "Quiet night — nothing worth a nudge.";
+  const report: string[] = [];
+  if (pushCount) report.push(await sendExpoPush("Heads up for tomorrow", result));
+  if (hasTelegram) {
+    const r: any = await fetch(`https://api.telegram.org/bot${cfg.telegramBotToken}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: cfg.telegramOwnerChatId, text: result }),
+    }).then((x) => x.json());
+    report.push(r.ok ? "Telegram delivered." : `Telegram failed: ${JSON.stringify(r)}`);
+  }
+  return `Nudged: ${report.join(" ")}`;
 }
 
 // Nightly habit learning: feed today's conversations back through the agent so
@@ -1517,10 +1587,11 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
       }
 
       // Manual "run it now" — also how delivery gets tested end to end.
-      // Body: { kind?: "morning" | "debrief" | "reflection" }
+      // Body: { kind?: "morning" | "debrief" | "nudge" | "reflection" }
       if (req.method === "POST" && url.pathname === "/briefing") {
         const { kind = "morning" } = JSON.parse((await readBody(req)) || "{}");
         if (kind === "reflection") return send(200, { report: await runNightlyReflection(client) });
+        if (kind === "nudge") return send(200, { report: await runNudgeAndDeliver(client) });
         return send(200, { report: await runBriefingAndDeliver(client, kind === "debrief" ? "debrief" : "morning") });
       }
 
@@ -1642,6 +1713,7 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
   };
   daily("morning briefing", cfg.briefingTime ?? "07:00", () => runBriefingAndDeliver(client, "morning"));
   daily("afternoon debrief", cfg.debriefTime ?? "16:30", () => runBriefingAndDeliver(client, "debrief"));
+  daily("evening nudge", cfg.nudgeTime ?? "20:00", () => runNudgeAndDeliver(client));
   daily("nightly reflection", cfg.reflectionTime ?? "21:30", () => runNightlyReflection(client));
 }
 
