@@ -97,6 +97,8 @@ interface Config {
   serverToken?: string; // shared secret the mobile app sends to the --serve brain
   briefingTime?: string; // "HH:MM" — when --serve sends the daily briefing (default 07:00)
   briefingTimezone?: string; // IANA tz for briefingTime (default America/New_York)
+  debriefTime?: string; // "HH:MM" — afternoon debrief (default 16:30)
+  reflectionTime?: string; // "HH:MM" — silent nightly habit-learning pass (default 21:30)
 }
 
 function askOnce(question: string): Promise<string> {
@@ -417,7 +419,9 @@ const filesTool: AgentTool = {
 //   3. Credentials → Create OAuth client ID → type "Desktop app"
 //   4. Run: homebase --google-auth   (paste client id + secret when prompted)
 
-const GOOGLE_SCOPE = "https://www.googleapis.com/auth/calendar.events";
+// calendar.events: read/write events. gmail.readonly: briefings summarize the
+// inbox — read-only, granted (or not) by the user on the consent screen.
+const GOOGLE_SCOPE = "https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/gmail.readonly";
 
 async function googleAccessToken(): Promise<string | null> {
   const cfg = load<Config>("config", {});
@@ -604,6 +608,58 @@ const gcalAddTool: AgentTool = {
   },
 };
 
+// ── Gmail (read-only) — important-email summaries for briefings ─────────────
+
+const gmailTool: AgentTool = {
+  schema: {
+    name: "gmail_summary",
+    description:
+      "List recent inbox emails (read-only) so you can summarize the important ones. Returns sender, " +
+      "subject, and snippet for each. Skips promotions/social. Use for morning briefings and " +
+      "'anything important in my email?' questions. Never invent emails not in the results.",
+    input_schema: {
+      type: "object",
+      properties: {
+        hours: { type: "number", description: "Look-back window in hours (default 24)" },
+        query: { type: "string", description: "Extra Gmail search filter, e.g. 'from:school.org' (optional)" },
+      },
+      required: [],
+    },
+  },
+  handler: async (input) => {
+    const token = await googleAccessToken();
+    if (!token) return "Gmail isn't connected. Re-run: homebase --google-auth (approve the Gmail read-only scope).";
+    const hours = input.hours ?? 24;
+    const q = `in:inbox -category:promotions -category:social newer_than:${Math.max(1, Math.ceil(hours / 24))}d${input.query ? ` ${input.query}` : ""}`;
+    const list: any = await (
+      await fetch(
+        `https://gmail.googleapis.com/gmail/v1/users/me/messages?` + new URLSearchParams({ q, maxResults: "15" }),
+        { headers: { Authorization: `Bearer ${token}` } }
+      )
+    ).json();
+    if (list.error) {
+      return list.error.status === "PERMISSION_DENIED" || list.error.code === 403
+        ? "Gmail scope not granted yet — re-run: homebase --google-auth (and enable the Gmail API in the Google Cloud project)."
+        : `Gmail error: ${list.error.message}`;
+    }
+    const ids: string[] = (list.messages ?? []).map((m: any) => m.id);
+    if (!ids.length) return "No inbox emails in that window.";
+    const rows: string[] = [];
+    for (const id of ids) {
+      const msg: any = await (
+        await fetch(
+          `https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}?format=metadata&metadataHeaders=From&metadataHeaders=Subject`,
+          { headers: { Authorization: `Bearer ${token}` } }
+        )
+      ).json();
+      const h = (name: string) => msg.payload?.headers?.find((x: any) => x.name === name)?.value ?? "";
+      const from = h("From").replace(/<.*>/, "").trim();
+      rows.push(`FROM ${from} — ${h("Subject")}${msg.snippet ? ` — ${msg.snippet.slice(0, 140)}` : ""}`);
+    }
+    return rows.join("\n");
+  },
+};
+
 // ── Phone calls via Vapi (make appointments, check on service requests) ────
 //
 // Requires in ~/.homebase/config.json:
@@ -787,7 +843,7 @@ const checkCallTool: AgentTool = {
 
 const TOOLS: AgentTool[] = [
   listsTool, calendarTool, memoryTool, weatherTool, filesTool,
-  gcalListTool, gcalAddTool, phoneCallTool, checkCallTool,
+  gcalListTool, gcalAddTool, gmailTool, phoneCallTool, checkCallTool,
 ];
 
 // ── MCP client — consume external MCP servers as extra agent tools ──────────
@@ -966,8 +1022,31 @@ const MORNING_BRIEFING_TASK = (cfg: Config) =>
   `Compose the family's morning briefing for today:
 1. Today's calendar — check Google Calendar if connected, plus the local family calendar.
 2. Current weather${cfg.homeCity ? ` in ${cfg.homeCity}` : " (look for a home city in family_memory; if none, skip weather)"}.
-3. Open items across all lists (skip empty ones).
+3. Important emails — if Gmail is connected (gmail_summary), pick out the 2-4 that actually matter; skip newsletters/receipts. If not connected, omit this section silently.
+4. Open items across all lists (skip empty ones).
+Check family_memory for 'habit' entries and tailor the briefing to them (e.g. lead with what this family checks first).
 Format it as one friendly, compact message with short sections — it's going to a family group chat.`;
+
+const AFTERNOON_DEBRIEF_TASK = (cfg: Config) =>
+  `Compose the family's afternoon debrief:
+1. Today's recap — which calendar events happened today (Google Calendar if connected, plus local).
+2. Tomorrow's appointments — list them so the family can prepare tonight.
+3. Important emails from today if Gmail is connected (gmail_summary, last ~10 hours); only ones needing action. Omit silently if not connected.
+4. Open list items that still need attention.
+Check family_memory for 'habit' entries and tailor accordingly.
+Keep it brief and warm — this is the "how'd today go, what's tomorrow" message.`;
+
+// Nightly, silent: review today's conversations and persist durable habits so
+// briefings get smarter over time. The agent writes via family_memory itself.
+const REFLECTION_TASK = (transcript: string) =>
+  `Below are today's conversations between the family and Homebase. Identify at most 3 DURABLE
+habits or preferences worth remembering long-term (recurring requests, standing preferences,
+schedules — NOT one-off facts already stored). Store each with family_memory using a key
+prefixed 'habit-' (update existing habit keys if refined). If nothing new, store nothing.
+Reply with one line describing what you stored or "nothing new".
+
+TODAY'S CONVERSATIONS:
+${transcript}`;
 
 // Deliver a message to every phone that registered via /register-push. Expo's
 // push API needs no key for sends; returns per-message tickets. Used by the
@@ -1151,6 +1230,8 @@ function hydrateConfigFromEnv(cfg: Config) {
     ["telegramBotToken", process.env.TELEGRAM_BOT_TOKEN],
     ["briefingTime", process.env.BRIEFING_TIME],
     ["briefingTimezone", process.env.BRIEFING_TZ],
+    ["debriefTime", process.env.DEBRIEF_TIME],
+    ["reflectionTime", process.env.REFLECTION_TIME],
   ];
   let dirty = false;
   for (const [k, v] of map) if (v && (cfg as any)[k] !== v) { (cfg as any)[k] = v; dirty = true; }
@@ -1180,16 +1261,18 @@ function msUntil(timeStr: string, tz: string): number {
   return delta * 1000;
 }
 
-async function runBriefingAndDeliver(client: Anthropic): Promise<string> {
+async function runBriefingAndDeliver(client: Anthropic, kind: "morning" | "debrief" = "morning"): Promise<string> {
   const cfg = load<Config>("config", {});
   const pushCount = Object.keys(load<Record<string, string>>("push", {})).length;
   const hasTelegram = !!(cfg.telegramBotToken && cfg.telegramOwnerChatId);
   if (!pushCount && !hasTelegram)
     return "Skipped: no delivery targets (no registered phones, no Telegram owner).";
-  const history: Anthropic.MessageParam[] = [{ role: "user", content: MORNING_BRIEFING_TASK(cfg) }];
+  const task = kind === "debrief" ? AFTERNOON_DEBRIEF_TASK(cfg) : MORNING_BRIEFING_TASK(cfg);
+  const title = kind === "debrief" ? "Afternoon debrief" : "Morning briefing";
+  const history: Anthropic.MessageParam[] = [{ role: "user", content: task }];
   const result = await runAgentTurn(client, history, false);
   const report: string[] = [];
-  if (pushCount) report.push(await sendExpoPush("Morning briefing", result));
+  if (pushCount) report.push(await sendExpoPush(title, result));
   if (hasTelegram) {
     const r: any = await fetch(`https://api.telegram.org/bot${cfg.telegramBotToken}/sendMessage`, {
       method: "POST",
@@ -1199,6 +1282,23 @@ async function runBriefingAndDeliver(client: Anthropic): Promise<string> {
     report.push(r.ok ? "Telegram delivered." : `Telegram failed: ${JSON.stringify(r)}`);
   }
   return report.join(" ");
+}
+
+// Nightly habit learning: feed today's conversations back through the agent so
+// it stores durable patterns via family_memory. Silent — no delivery.
+async function runNightlyReflection(client: Anthropic): Promise<string> {
+  const stored = load<StoredSessions>("sessions", {});
+  // Sessions don't carry timestamps, so "today" ≈ the trailing window of each session.
+  const lines: string[] = [];
+  for (const [id, history] of Object.entries(stored)) {
+    for (const m of history.slice(-20)) {
+      if (m.role === "user" && typeof m.content === "string" && !m.content.startsWith("[system note"))
+        lines.push(`[${id}] ${m.content.slice(0, 300)}`);
+    }
+  }
+  if (lines.length < 3) return "Skipped: not enough conversation today to learn from.";
+  const history: Anthropic.MessageParam[] = [{ role: "user", content: REFLECTION_TASK(lines.slice(-60).join("\n")) }];
+  return runAgentTurn(client, history, false);
 }
 
 // Repair a session whose tool_use/tool_result pairing got broken (e.g. a message
@@ -1286,9 +1386,12 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
         return send(200, { reply });
       }
 
-      // Manual "run the briefing now" — also how delivery gets tested end to end.
+      // Manual "run it now" — also how delivery gets tested end to end.
+      // Body: { kind?: "morning" | "debrief" | "reflection" }
       if (req.method === "POST" && url.pathname === "/briefing") {
-        return send(200, { report: await runBriefingAndDeliver(client) });
+        const { kind = "morning" } = JSON.parse((await readBody(req)) || "{}");
+        if (kind === "reflection") return send(200, { report: await runNightlyReflection(client) });
+        return send(200, { report: await runBriefingAndDeliver(client, kind === "debrief" ? "debrief" : "morning") });
       }
 
       if (req.method === "POST" && url.pathname === "/register-push") {
@@ -1314,19 +1417,23 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
     if (!process.env.HOMEBASE_SERVER_TOKEN) console.log(`\n  Auth token (set as HOMEBASE_SERVER_TOKEN on the app + Railway): ${token}`);
   });
 
-  // Daily briefing loop — reschedules after each run so DST shifts self-correct.
-  const briefTime = cfg.briefingTime ?? "07:00";
+  // Daily job loops — each reschedules after its run so DST shifts self-correct.
   const briefTz = cfg.briefingTimezone ?? "America/New_York";
-  const briefTick = async () => {
-    try {
-      console.log(`[briefing] ${await runBriefingAndDeliver(client)}`);
-    } catch (err: any) {
-      console.error(`[briefing] failed: ${err.message}`);
-    }
-    setTimeout(briefTick, msUntil(briefTime, briefTz));
+  const daily = (label: string, timeStr: string, job: () => Promise<string>) => {
+    const tick = async () => {
+      try {
+        console.log(`[${label}] ${await job()}`);
+      } catch (err: any) {
+        console.error(`[${label}] failed: ${err.message}`);
+      }
+      setTimeout(tick, msUntil(timeStr, briefTz));
+    };
+    setTimeout(tick, msUntil(timeStr, briefTz));
+    console.log(`  ${label} scheduled daily at ${timeStr} ${briefTz}`);
   };
-  setTimeout(briefTick, msUntil(briefTime, briefTz));
-  console.log(`  daily briefing scheduled for ${briefTime} ${briefTz}`);
+  daily("morning briefing", cfg.briefingTime ?? "07:00", () => runBriefingAndDeliver(client, "morning"));
+  daily("afternoon debrief", cfg.debriefTime ?? "16:30", () => runBriefingAndDeliver(client, "debrief"));
+  daily("nightly reflection", cfg.reflectionTime ?? "21:30", () => runNightlyReflection(client));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
