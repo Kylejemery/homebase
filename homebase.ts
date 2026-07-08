@@ -1651,6 +1651,17 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
         return send(200, { ok: true });
       }
 
+      // Ops visibility: where is data actually going, and is anything in it?
+      if (req.method === "GET" && url.pathname === "/status") {
+        return send(200, {
+          dataDir: DIR,
+          homebaseDirEnv: process.env.HOMEBASE_DIR ?? null,
+          pushTokens: Object.keys(load<Record<string, string>>("push", {})).length,
+          sessions: Object.keys(load<StoredSessions>("sessions", {})).length,
+          listItems: Object.values(load<Lists>("lists", {})).reduce((n, l) => n + l.length, 0),
+        });
+      }
+
       // ── Structured data for the app's Grocery + Calendar screens ──────────
       // Household-shared by design: one brain, one data set, every phone equal.
 
