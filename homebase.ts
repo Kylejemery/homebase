@@ -1488,6 +1488,53 @@ async function extractIngredients(
   }
 }
 
+// Document memory: photo of a school calendar / insurance card / router label →
+// vision-extract the durable facts → family_memory. Strong model on purpose —
+// a misread policy number is worse than a slow scan.
+async function extractDocumentFacts(
+  client: Anthropic,
+  input: { image: string; mediaType?: string; hint?: string }
+): Promise<{ summary: string; facts: { key: string; fact: string }[] }> {
+  const resp = await createWithRetry(client, {
+    model: STRONG_MODEL,
+    max_tokens: 1500,
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "image", source: { type: "base64", media_type: (input.mediaType as any) ?? "image/jpeg", data: input.image } },
+          {
+            type: "text",
+            text:
+              `This is a photo of a household document (school calendar, insurance card, appliance manual, ` +
+              `wifi router label, permission slip, etc.).${input.hint ? ` The user says: "${input.hint}".` : ""} ` +
+              `Identify it and extract the durable facts a family assistant should remember. Copy numbers/codes ` +
+              `EXACTLY as printed — if a character is ambiguous, note it in the fact. Reply with ONLY JSON: ` +
+              `{"summary": "one line saying what this is", "facts": [{"key": "kebab-case-specific-key", "fact": "value"}]} ` +
+              `— max 10 facts, keys specific (e.g. "insurance-anthem-member-id", "wifi-network-password", ` +
+              `"school-fall-break-dates"). If unreadable: {"summary": "unreadable", "facts": []}`,
+          },
+        ],
+      },
+    ],
+  });
+  const text = resp.content.filter((b): b is Anthropic.TextBlock => b.type === "text").map((b) => b.text).join("");
+  const match = text.match(/\{[\s\S]*\}/);
+  if (!match) return { summary: "unreadable", facts: [] };
+  try {
+    const parsed = JSON.parse(match[0]);
+    return {
+      summary: String(parsed.summary ?? "document"),
+      facts: (parsed.facts ?? [])
+        .filter((f: any) => f?.key && f?.fact)
+        .slice(0, 10)
+        .map((f: any) => ({ key: String(f.key).toLowerCase().replace(/[^a-z0-9-]+/g, "-"), fact: String(f.fact) })),
+    };
+  } catch {
+    return { summary: "unreadable", facts: [] };
+  }
+}
+
 function addToList(listName: string, items: string[]): { id: number; item: string }[] {
   const lists = load<Lists>("lists", {});
   lists[listName] ??= [];
@@ -1681,6 +1728,18 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
         if (!ingredients.length) return send(200, { added: [], message: "No ingredients found — is that a recipe?" });
         const added = addToList(body.list ? String(body.list).toLowerCase() : "grocery", ingredients);
         return send(200, { added });
+      }
+
+      // Document scan: { image (base64), mediaType, hint? } → facts into family_memory.
+      if (req.method === "POST" && url.pathname === "/document") {
+        const body = JSON.parse((await readBody(req)) || "{}");
+        if (!body.image) return send(400, { error: "image required" });
+        const { summary, facts } = await extractDocumentFacts(client, body);
+        if (!facts.length) return send(200, { summary, stored: [], message: "Couldn't read anything durable from that photo." });
+        const mem = load<Record<string, string>>("memory", {});
+        for (const f of facts) mem[f.key] = f.fact;
+        save("memory", mem);
+        return send(200, { summary, stored: facts });
       }
 
       return send(404, { error: "not found" });
