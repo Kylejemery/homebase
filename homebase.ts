@@ -1925,6 +1925,7 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
     setTimeout(tick, msUntil(timeStr, briefTz));
     console.log(`  ${label} scheduled daily at ${timeStr} ${briefTz}`);
   };
+  daily("restock check", "05:30", async () => runRestock()); // before the briefing so it can announce
   daily("morning briefing", cfg.briefingTime ?? "07:00", () => runBriefingAndDeliver(client, "morning"));
   daily("afternoon debrief", cfg.debriefTime ?? "16:30", () => runBriefingAndDeliver(client, "debrief"));
   daily("evening nudge", cfg.nudgeTime ?? "20:00", () => runNudgeAndDeliver(client));
