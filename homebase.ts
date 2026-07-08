@@ -207,6 +207,7 @@ const listsTool: AgentTool = {
         if (!it) return `No #${input.id} in ${name}.`;
         it.done = true;
         save("lists", lists);
+        if (name === "grocery") logCheckoff(it.item);
         return `Checked off: ${it.item}`;
       }
       case "remove": {
@@ -608,7 +609,30 @@ const gcalAddTool: AgentTool = {
     });
     const data: any = await res.json();
     if (!res.ok) return `Google Calendar error: ${data.error?.message ?? res.status}`;
-    return `Added to Google Calendar: ${gcalFmt(data)}${data.htmlLink ? `\n${data.htmlLink}` : ""}`;
+    let out = `Added to Google Calendar: ${gcalFmt(data)}${data.htmlLink ? `\n${data.htmlLink}` : ""}`;
+    // conflict watch: anything else that day within ±90 min of the new start
+    if (!input.all_day) {
+      const day = input.start.slice(0, 10);
+      const dayRes: any = await (
+        await fetch(
+          `https://www.googleapis.com/calendar/v3/calendars/primary/events?` +
+            new URLSearchParams({
+              timeMin: new Date(`${day}T00:00:00`).toISOString(),
+              timeMax: new Date(`${day}T23:59:59`).toISOString(),
+              singleEvents: "true", orderBy: "startTime", maxResults: "20",
+            }),
+          { headers: { Authorization: `Bearer ${token}` } }
+        )
+      ).json();
+      const startMs = new Date(input.start).getTime();
+      const clashes = (dayRes.items ?? []).filter(
+        (e: any) =>
+          e.id !== data.id && e.start?.dateTime &&
+          Math.abs(new Date(e.start.dateTime).getTime() - startMs) < 90 * 60 * 1000
+      );
+      if (clashes.length) out += `\n⚠ Possible conflict with: ${clashes.map(gcalFmt).join("; ")}`;
+    }
+    return out;
   },
 };
 
@@ -912,9 +936,74 @@ const checkCallTool: AgentTool = {
   },
 };
 
+// ── Commitments — standing tasks with a due date or trigger condition ───────
+
+interface Commitment {
+  id: number;
+  text: string;
+  due?: string; // YYYY-MM-DD when date-bound; condition lives in the text otherwise
+  createdAt: string;
+  status: "open" | "done";
+}
+
+const commitmentsTool: AgentTool = {
+  schema: {
+    name: "manage_commitments",
+    description:
+      "Standing follow-ups the user asked for later ('call Dr. Patel Tuesday if the referral hasn't arrived', " +
+      "'remind me to sign the permission slip by Friday'). Actions: 'add' (text + optional due YYYY-MM-DD), " +
+      "'list' (open commitments), 'complete' (by id). Proactively add one whenever the user requests a future " +
+      "or conditional action. The daily briefing and evening nudge surface due/overdue ones — ALWAYS ask " +
+      "before acting on a commitment, never execute it unprompted.",
+    input_schema: {
+      type: "object",
+      properties: {
+        action: { type: "string", enum: ["add", "list", "complete"] },
+        text: { type: "string", description: "What to follow up on, including any condition" },
+        due: { type: "string", description: "YYYY-MM-DD (optional)" },
+        id: { type: "number", description: "Commitment id (for 'complete')" },
+      },
+      required: ["action"],
+    },
+  },
+  handler: async (input) => {
+    const all = load<Commitment[]>("commitments", []);
+    switch (input.action) {
+      case "add": {
+        if (!input.text) return "Need the commitment text.";
+        const id = (all.at(-1)?.id ?? 0) + 1;
+        all.push({ id, text: input.text, due: input.due, createdAt: new Date().toISOString(), status: "open" });
+        save("commitments", all);
+        return `Commitment #${id} stored: ${input.text}${input.due ? ` (due ${input.due})` : ""}`;
+      }
+      case "list": {
+        const open = all.filter((c) => c.status === "open");
+        if (!open.length) return "No open commitments.";
+        const today = new Date().toISOString().slice(0, 10);
+        return open
+          .map((c) => {
+            const flag = c.due && c.due <= today ? (c.due === today ? " ⏰ DUE TODAY" : " ⚠ OVERDUE") : "";
+            return `#${c.id} ${c.text}${c.due ? ` (due ${c.due})` : ""}${flag}`;
+          })
+          .join("\n");
+      }
+      case "complete": {
+        const c = all.find((x) => x.id === input.id);
+        if (!c) return `No commitment #${input.id}.`;
+        c.status = "done";
+        save("commitments", all);
+        return `Done: ${c.text}`;
+      }
+      default:
+        return "Unknown action.";
+    }
+  },
+};
+
 const TOOLS: AgentTool[] = [
   listsTool, calendarTool, memoryTool, weatherTool, filesTool,
   gcalListTool, gcalAddTool, gmailTool, smsTool, phoneCallTool, checkCallTool,
+  commitmentsTool,
 ];
 
 // ── MCP client — consume external MCP servers as extra agent tools ──────────
@@ -966,6 +1055,14 @@ Today is ${new Date().toDateString()} (${new Date().toISOString().slice(0, 10)})
 Resolve relative dates ("Saturday", "tomorrow") to ISO datetimes yourself before calling calendar tools.
 Proactively store useful facts in family_memory when people mention them.
 Be concise and practical — you're texting busy parents, not writing essays.
+ERRAND CHAINS: for multi-step requests ("book the haircut, add it to the calendar, text Aundrea the time"),
+present ONE combined plan and get ONE confirmation covering every outward action (calls, texts) — then execute
+the whole chain without re-asking between steps, and report each step's outcome at the end.
+FOLLOW-UPS: when the user asks for a future or conditional follow-up ("call them Tuesday if X hasn't happened"),
+store it with manage_commitments so the daily briefings can surface it. Never act on a stored commitment
+without asking first.
+CONFLICTS: when adding calendar events, watch for clashes — with existing events AND with known routines
+in family_memory habits — and mention them.
 TEXTS: you can send real SMS with send_sms. ALWAYS confirm the recipient and exact text with the user first.
 PHONE CALLS: you can place real calls with make_phone_call. Before calling, ALWAYS confirm with the user:
 the number, the goal, and exactly what personal info you may share (pull known facts from family_memory,
@@ -1095,7 +1192,10 @@ const MORNING_BRIEFING_TASK = (cfg: Config) =>
 1. Today's calendar — check Google Calendar if connected, plus the local family calendar.
 2. Current weather${cfg.homeCity ? ` in ${cfg.homeCity}` : " (look for a home city in family_memory; if none, skip weather)"}.
 3. Important emails — if Gmail is connected (gmail_summary), pick out the 2-4 that actually matter; skip newsletters/receipts. If not connected, omit this section silently.
-4. Open items across all lists (skip empty ones).
+4. Open items across all lists (skip empty ones). Check family_memory for a 'restock-report' entry —
+   if it's dated today, mention which staples were auto-added and invite removing any not needed.
+5. Open commitments (manage_commitments list) — surface anything due today or overdue and ask
+   whether to act; never act on one unprompted.
 Check family_memory for 'habit' entries and tailor the briefing to them (e.g. lead with what this family checks first).
 Format it as one friendly, compact message with short sections — it's going to a family group chat.`;
 
@@ -1121,6 +1221,8 @@ const NUDGE_TASK = (cfg: Config) =>
    "📩 From your email: <event> — <date/time>. Want it on the calendar? Just reply here."
    NEVER add calendar events yourself during this scan — only propose.
 3. family_memory 'habit' entries vs tomorrow: conflicts with known routines.
+4. Open commitments (manage_commitments list): anything due tomorrow — include it as a reminder
+   with a question ("want me to handle it?"), never act on it yourself during this scan.
 RULES: Be selective — a nudge that fires nightly gets ignored. If NOTHING genuinely warrants a
 heads-up, reply with exactly the single word: NOTHING
 Otherwise reply with the nudge message only (short, friendly, actionable)${cfg.ownerName ? ` — it goes to ${cfg.ownerName}'s family` : ""}.`;
@@ -1535,6 +1637,47 @@ async function extractDocumentFacts(
   }
 }
 
+// Rolling record of grocery check-offs — the signal the restock learner reads.
+function logCheckoff(item: string) {
+  const log = load<{ item: string; at: string }[]>("restock-log", []);
+  log.push({ item: item.toLowerCase().trim(), at: new Date().toISOString() });
+  save("restock-log", log.slice(-500));
+}
+
+// Recurring restock: items checked off ≥3 times on a steady cadence (3–21 days),
+// overdue by their own rhythm, and not already on the list → pre-add them.
+// Purely statistical — no model call. The morning briefing announces the result.
+function runRestock(): string {
+  const log = load<{ item: string; at: string }[]>("restock-log", []);
+  const lists = load<Lists>("lists", {});
+  const openNames = new Set((lists["grocery"] ?? []).filter((i) => !i.done).map((i) => i.item.toLowerCase().trim()));
+  const byItem = new Map<string, number[]>();
+  for (const e of log) {
+    const k = e.item;
+    if (!byItem.has(k)) byItem.set(k, []);
+    byItem.get(k)!.push(Date.parse(e.at));
+  }
+  const now = Date.now();
+  const added: string[] = [];
+  for (const [name, times] of byItem) {
+    if (openNames.has(name)) continue;
+    const recent = times.filter((t) => now - t < 60 * 86400000).sort((a, b) => a - b);
+    if (recent.length < 3) continue;
+    const gaps = recent.slice(1).map((t, i) => t - recent[i]).sort((a, b) => a - b);
+    const median = gaps[Math.floor(gaps.length / 2)];
+    if (median < 3 * 86400000 || median > 21 * 86400000) continue; // steady household cadence only
+    if (now - recent[recent.length - 1] < median) continue; // not due yet by its own rhythm
+    addToList("grocery", [name]);
+    added.push(name);
+  }
+  if (added.length) {
+    const mem = load<Record<string, string>>("memory", {});
+    mem["restock-report"] = `${new Date().toISOString().slice(0, 10)}: auto-added ${added.join(", ")} (based on the family's buying rhythm)`;
+    save("memory", mem);
+  }
+  return added.length ? `Restocked: ${added.join(", ")}` : "No restock due.";
+}
+
 function addToList(listName: string, items: string[]): { id: number; item: string }[] {
   const lists = load<Lists>("lists", {});
   lists[listName] ??= [];
@@ -1683,6 +1826,7 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
         if (!it) return send(404, { error: `no #${id} in ${list}` });
         it.done = !it.done;
         save("lists", lists);
+        if (it.done && String(list).toLowerCase() === "grocery") logCheckoff(it.item);
         return send(200, { lists });
       }
 
