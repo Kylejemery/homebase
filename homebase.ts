@@ -99,6 +99,9 @@ interface Config {
   briefingTimezone?: string; // IANA tz for briefingTime (default America/New_York)
   debriefTime?: string; // "HH:MM" — afternoon debrief (default 16:30)
   reflectionTime?: string; // "HH:MM" — silent nightly habit-learning pass (default 21:30)
+  twilioAccountSid?: string;
+  twilioAuthToken?: string;
+  twilioFromNumber?: string; // E.164 — the agent's own number
 }
 
 function askOnce(question: string): Promise<string> {
@@ -660,6 +663,45 @@ const gmailTool: AgentTool = {
   },
 };
 
+// ── SMS via Twilio — the agent texts family members or anyone else ──────────
+
+const smsTool: AgentTool = {
+  schema: {
+    name: "send_sms",
+    description:
+      "Send a text message (SMS) from the family agent's own Twilio number. Use for reminders, " +
+      "sharing lists, or notifying a family member. ALWAYS confirm the recipient number and exact " +
+      "message text with the user before sending — never send unprompted. Numbers in E.164 (+1...).",
+    input_schema: {
+      type: "object",
+      properties: {
+        to: { type: "string", description: "Recipient, E.164 e.g. +19195551234" },
+        body: { type: "string", description: "Message text (keep under 320 chars)" },
+      },
+      required: ["to", "body"],
+    },
+  },
+  handler: async (input) => {
+    const cfg = vapiCfg(); // same fresh-config loader the call tools use
+    if (!cfg.twilioAccountSid || !cfg.twilioAuthToken || !cfg.twilioFromNumber)
+      return "SMS isn't configured. Add twilioAccountSid, twilioAuthToken, twilioFromNumber to " + FILE("config");
+    const res = await fetch(
+      `https://api.twilio.com/2010-04-01/Accounts/${cfg.twilioAccountSid}/Messages.json`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: "Basic " + Buffer.from(`${cfg.twilioAccountSid}:${cfg.twilioAuthToken}`).toString("base64"),
+          "Content-Type": "application/x-www-form-urlencoded",
+        },
+        body: new URLSearchParams({ To: input.to, From: cfg.twilioFromNumber, Body: input.body }),
+      }
+    );
+    const data: any = await res.json();
+    if (!res.ok) return `SMS failed: ${data.message ?? JSON.stringify(data)}`;
+    return `Text sent to ${input.to} (sid ${data.sid}, status ${data.status}).`;
+  },
+};
+
 // ── Phone calls via Vapi (make appointments, check on service requests) ────
 //
 // Requires in ~/.homebase/config.json:
@@ -843,7 +885,7 @@ const checkCallTool: AgentTool = {
 
 const TOOLS: AgentTool[] = [
   listsTool, calendarTool, memoryTool, weatherTool, filesTool,
-  gcalListTool, gcalAddTool, gmailTool, phoneCallTool, checkCallTool,
+  gcalListTool, gcalAddTool, gmailTool, smsTool, phoneCallTool, checkCallTool,
 ];
 
 // ── MCP client — consume external MCP servers as extra agent tools ──────────
@@ -895,6 +937,7 @@ Today is ${new Date().toDateString()} (${new Date().toISOString().slice(0, 10)})
 Resolve relative dates ("Saturday", "tomorrow") to ISO datetimes yourself before calling calendar tools.
 Proactively store useful facts in family_memory when people mention them.
 Be concise and practical — you're texting busy parents, not writing essays.
+TEXTS: you can send real SMS with send_sms. ALWAYS confirm the recipient and exact text with the user first.
 PHONE CALLS: you can place real calls with make_phone_call. Before calling, ALWAYS confirm with the user:
 the number, the goal, and exactly what personal info you may share (pull known facts from family_memory,
 ask for anything missing like DOB or insurance if the task needs it). After placing a call, tell the user
@@ -1232,6 +1275,9 @@ function hydrateConfigFromEnv(cfg: Config) {
     ["briefingTimezone", process.env.BRIEFING_TZ],
     ["debriefTime", process.env.DEBRIEF_TIME],
     ["reflectionTime", process.env.REFLECTION_TIME],
+    ["twilioAccountSid", process.env.TWILIO_ACCOUNT_SID],
+    ["twilioAuthToken", process.env.TWILIO_AUTH_TOKEN],
+    ["twilioFromNumber", process.env.TWILIO_FROM_NUMBER],
   ];
   let dirty = false;
   for (const [k, v] of map) if (v && (cfg as any)[k] !== v) { (cfg as any)[k] = v; dirty = true; }
