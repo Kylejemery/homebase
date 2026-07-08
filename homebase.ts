@@ -1201,6 +1201,38 @@ async function runBriefingAndDeliver(client: Anthropic): Promise<string> {
   return report.join(" ");
 }
 
+// Repair a session whose tool_use/tool_result pairing got broken (e.g. a message
+// was injected mid-turn, or the process died between the two). The API rejects the
+// whole conversation otherwise, permanently bricking the persisted session.
+function sanitizeHistory(history: Anthropic.MessageParam[]) {
+  while (history.length && history[0].role !== "user") history.shift();
+  while (history.length && Array.isArray(history[0].content) &&
+         (history[0].content as any[])[0]?.type === "tool_result") {
+    history.shift();
+  }
+  for (let i = 0; i < history.length; i++) {
+    const msg = history[i];
+    if (msg.role !== "assistant" || !Array.isArray(msg.content)) continue;
+    const ids = (msg.content as any[]).filter((b) => b.type === "tool_use").map((b) => b.id);
+    if (!ids.length) continue;
+    const next = history[i + 1];
+    const nextResults =
+      next?.role === "user" && Array.isArray(next.content)
+        ? new Set((next.content as any[]).filter((b) => b.type === "tool_result").map((b) => b.tool_use_id))
+        : new Set<string>();
+    const missing = ids.filter((id) => !nextResults.has(id));
+    if (!missing.length) continue;
+    const synthetic = missing.map((id) => ({
+      type: "tool_result" as const, tool_use_id: id, content: "(result lost — session was interrupted)",
+    }));
+    if (next?.role === "user" && Array.isArray(next.content) && (next.content as any[])[0]?.type === "tool_result") {
+      (next.content as any[]).unshift(...synthetic);
+    } else {
+      history.splice(i + 1, 0, { role: "user", content: synthetic });
+    }
+  }
+}
+
 async function serveMode(client: Anthropic, cfg: Config, port: number) {
   hydrateConfigFromEnv(cfg);
   let token = process.env.HOMEBASE_SERVER_TOKEN || cfg.serverToken;
@@ -1214,6 +1246,7 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
     Object.entries(load<StoredSessions>("sessions", {}))
   );
   const saveSessions = () => save("sessions", Object.fromEntries(sessions));
+  const pendingNotes = new Map<string, string[]>(); // call outcomes awaiting the session's next turn
 
   const server = http.createServer(async (req, res) => {
     const send = (code: number, obj: unknown) => {
@@ -1232,11 +1265,24 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
         if (!message || typeof message !== "string") return send(400, { error: "message (string) required" });
         const history = sessions.get(sessionId) ?? [];
         sessions.set(sessionId, history);
-        history.push({ role: "user", content: message });
+        sanitizeHistory(history); // repair sessions bricked by older followup injection
+        const notes = pendingNotes.get(sessionId);
+        pendingNotes.delete(sessionId);
+        history.push({
+          role: "user",
+          content: notes?.length ? `[system note — completed call outcome: ${notes.join(" | ")}]\n${message}` : message,
+        });
         const reply = await runAgentTurn(client, history, false);
         trimHistory(history);
         saveSessions();
-        scheduleCallFollowups((t) => { const h = sessions.get(sessionId); if (h) { h.push({ role: "assistant", content: t }); saveSessions(); } });
+        // Call outcomes go out as push notifications and surface as a note on the
+        // next turn — never appended to a live history (that corrupts mid-flight turns).
+        scheduleCallFollowups((t) => {
+          const q = pendingNotes.get(sessionId) ?? [];
+          q.push(t);
+          pendingNotes.set(sessionId, q);
+          sendExpoPush("Call update", t).catch(() => {});
+        });
         return send(200, { reply });
       }
 
