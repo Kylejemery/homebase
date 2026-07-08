@@ -1238,8 +1238,16 @@ function hydrateConfigFromEnv(cfg: Config) {
   const ownerChat = Number(process.env.TELEGRAM_OWNER_CHAT_ID);
   if (ownerChat && cfg.telegramOwnerChatId !== ownerChat) { cfg.telegramOwnerChatId = ownerChat; dirty = true; }
   // Google OAuth tokens as a JSON blob (copy from a local `--google-auth` run).
-  if (process.env.GOOGLE_TOKENS && !cfg.googleTokens) {
-    try { cfg.googleTokens = JSON.parse(process.env.GOOGLE_TOKENS); dirty = true; } catch {}
+  // A new refresh_token means a new consent (e.g. scopes added) — adopt it even
+  // over saved tokens; the stale expires_at just triggers a refresh on first use.
+  if (process.env.GOOGLE_TOKENS) {
+    try {
+      const envTokens = JSON.parse(process.env.GOOGLE_TOKENS);
+      if (!cfg.googleTokens || (envTokens.refresh_token && envTokens.refresh_token !== cfg.googleTokens.refresh_token)) {
+        cfg.googleTokens = envTokens;
+        dirty = true;
+      }
+    } catch {}
   }
   if (dirty) save("config", cfg);
 }
