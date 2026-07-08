@@ -1355,6 +1355,82 @@ async function runNightlyReflection(client: Anthropic): Promise<string> {
   return runAgentTurn(client, history, false);
 }
 
+// ── Recipe → grocery ingredients (link or photo) ─────────────────────────────
+// Fast path: most recipe sites embed schema.org/Recipe JSON-LD with the exact
+// ingredient list — no model call needed. Fallback: strip the page to text (or
+// take the photo) and have the fast model return a JSON array of ingredients.
+
+function findJsonLdIngredients(html: string): string[] | null {
+  const scripts = [...html.matchAll(/<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)];
+  for (const m of scripts) {
+    try {
+      const data = JSON.parse(m[1]);
+      const nodes: any[] = Array.isArray(data) ? data : data["@graph"] ?? [data];
+      for (const n of nodes) {
+        if (Array.isArray(n?.recipeIngredient) && n.recipeIngredient.length)
+          return n.recipeIngredient.map((x: unknown) => String(x).trim());
+      }
+    } catch {}
+  }
+  return null;
+}
+
+async function extractIngredients(
+  client: Anthropic,
+  input: { url?: string; image?: string; mediaType?: string }
+): Promise<string[]> {
+  let content: Anthropic.MessageParam["content"];
+  if (input.url) {
+    const html = await (
+      await fetch(input.url, { headers: { "User-Agent": "Mozilla/5.0 (Homebase family agent)" } })
+    ).text();
+    const ld = findJsonLdIngredients(html);
+    if (ld) return ld;
+    const text = html
+      .replace(/<script[\s\S]*?<\/script>/gi, " ")
+      .replace(/<style[\s\S]*?<\/style>/gi, " ")
+      .replace(/<[^>]+>/g, " ")
+      .replace(/\s+/g, " ")
+      .slice(0, 15000);
+    content = `Extract the recipe's ingredient list from this page text. Reply with ONLY a JSON array of strings, each a shopping-list item like "2 lbs chicken thighs". No commentary. If there's no recipe, reply []. PAGE TEXT: ${text}`;
+  } else if (input.image) {
+    content = [
+      {
+        type: "image",
+        source: { type: "base64", media_type: (input.mediaType as any) ?? "image/jpeg", data: input.image },
+      },
+      {
+        type: "text",
+        text: 'Extract the recipe\'s ingredient list from this photo. Reply with ONLY a JSON array of strings, each a shopping-list item like "2 lbs chicken thighs". No commentary. If no recipe is visible, reply [].',
+      },
+    ];
+  } else {
+    return [];
+  }
+  const resp = await createWithRetry(client, { model: FAST_MODEL, max_tokens: 1200, messages: [{ role: "user", content }] });
+  const text = resp.content.filter((b): b is Anthropic.TextBlock => b.type === "text").map((b) => b.text).join("");
+  const match = text.match(/\[[\s\S]*\]/);
+  if (!match) return [];
+  try {
+    return (JSON.parse(match[0]) as unknown[]).map((x) => String(x).trim()).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function addToList(listName: string, items: string[]): { id: number; item: string }[] {
+  const lists = load<Lists>("lists", {});
+  lists[listName] ??= [];
+  const added: { id: number; item: string }[] = [];
+  for (const item of items) {
+    const id = (lists[listName].at(-1)?.id ?? 0) + 1;
+    lists[listName].push({ id, item, done: false });
+    added.push({ id, item });
+  }
+  save("lists", lists);
+  return added;
+}
+
 // Repair a session whose tool_use/tool_result pairing got broken (e.g. a message
 // was injected mid-turn, or the process died between the two). The API rejects the
 // whole conversation otherwise, permanently bricking the persisted session.
@@ -1455,6 +1531,85 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
         tokens[sessionId] = pushToken;
         save("push", tokens);
         return send(200, { ok: true });
+      }
+
+      // ── Structured data for the app's Grocery + Calendar screens ──────────
+      // Household-shared by design: one brain, one data set, every phone equal.
+
+      if (req.method === "GET" && url.pathname === "/lists") {
+        return send(200, { lists: load<Lists>("lists", {}) });
+      }
+
+      if (req.method === "POST" && url.pathname === "/lists/add") {
+        const { list = "grocery", item } = JSON.parse((await readBody(req)) || "{}");
+        if (!item || typeof item !== "string") return send(400, { error: "item (string) required" });
+        addToList(String(list).toLowerCase(), [item.trim()]);
+        return send(200, { lists: load<Lists>("lists", {}) });
+      }
+
+      if (req.method === "POST" && url.pathname === "/lists/toggle") {
+        const { list, id } = JSON.parse((await readBody(req)) || "{}");
+        const lists = load<Lists>("lists", {});
+        const it = lists[String(list).toLowerCase()]?.find((i) => i.id === Number(id));
+        if (!it) return send(404, { error: `no #${id} in ${list}` });
+        it.done = !it.done;
+        save("lists", lists);
+        return send(200, { lists });
+      }
+
+      if (req.method === "POST" && url.pathname === "/lists/remove") {
+        const { list, id } = JSON.parse((await readBody(req)) || "{}");
+        const lists = load<Lists>("lists", {});
+        const arr = lists[String(list).toLowerCase()] ?? [];
+        const idx = arr.findIndex((i) => i.id === Number(id));
+        if (idx === -1) return send(404, { error: `no #${id} in ${list}` });
+        arr.splice(idx, 1);
+        save("lists", lists);
+        return send(200, { lists });
+      }
+
+      if (req.method === "GET" && url.pathname === "/calendar") {
+        const days = Math.min(60, Number(url.searchParams.get("days")) || 14);
+        const now = new Date();
+        const horizon = new Date(now.getTime() + days * 86400000);
+        type Ev = { title: string; start: string; end?: string; who?: string; notes?: string; source: string };
+        const events: Ev[] = load<CalEvent[]>("calendar", [])
+          .filter((e) => new Date(e.start) >= new Date(now.getTime() - 86400000) && new Date(e.start) <= horizon)
+          .map((e) => ({ title: e.title, start: e.start, end: e.end, who: e.who, notes: e.notes, source: "local" }));
+        const gtoken = await googleAccessToken();
+        if (gtoken) {
+          const g: any = await (
+            await fetch(
+              `https://www.googleapis.com/calendar/v3/calendars/primary/events?` +
+                new URLSearchParams({
+                  timeMin: now.toISOString(), timeMax: horizon.toISOString(),
+                  singleEvents: "true", orderBy: "startTime", maxResults: "50",
+                }),
+              { headers: { Authorization: `Bearer ${gtoken}` } }
+            )
+          ).json();
+          for (const e of g.items ?? []) {
+            events.push({
+              title: e.summary ?? "(untitled)",
+              start: e.start?.dateTime ?? e.start?.date ?? "",
+              end: e.end?.dateTime ?? e.end?.date,
+              notes: e.location,
+              source: "google",
+            });
+          }
+        }
+        events.sort((a, b) => a.start.localeCompare(b.start));
+        return send(200, { events });
+      }
+
+      // Recipe import: { url } or { image (base64), mediaType } → grocery list.
+      if (req.method === "POST" && url.pathname === "/recipe") {
+        const body = JSON.parse((await readBody(req)) || "{}");
+        if (!body.url && !body.image) return send(400, { error: "url or image required" });
+        const ingredients = await extractIngredients(client, body);
+        if (!ingredients.length) return send(200, { added: [], message: "No ingredients found — is that a recipe?" });
+        const added = addToList(body.list ? String(body.list).toLowerCase() : "grocery", ingredients);
+        return send(200, { added });
       }
 
       return send(404, { error: "not found" });
