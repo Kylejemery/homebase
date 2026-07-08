@@ -95,6 +95,8 @@ interface Config {
   haikuRouting?: boolean; // false disables fast-model routing of trivial turns
   mcpServers?: { name: string; command: string; args?: string[] }[];
   serverToken?: string; // shared secret the mobile app sends to the --serve brain
+  briefingTime?: string; // "HH:MM" — when --serve sends the daily briefing (default 07:00)
+  briefingTimezone?: string; // IANA tz for briefingTime (default America/New_York)
 }
 
 function askOnce(question: string): Promise<string> {
@@ -1146,14 +1148,57 @@ function hydrateConfigFromEnv(cfg: Config) {
     ["homeCity", process.env.HOME_CITY],
     ["googleClientId", process.env.GOOGLE_CLIENT_ID],
     ["googleClientSecret", process.env.GOOGLE_CLIENT_SECRET],
+    ["telegramBotToken", process.env.TELEGRAM_BOT_TOKEN],
+    ["briefingTime", process.env.BRIEFING_TIME],
+    ["briefingTimezone", process.env.BRIEFING_TZ],
   ];
   let dirty = false;
   for (const [k, v] of map) if (v && (cfg as any)[k] !== v) { (cfg as any)[k] = v; dirty = true; }
+  const ownerChat = Number(process.env.TELEGRAM_OWNER_CHAT_ID);
+  if (ownerChat && cfg.telegramOwnerChatId !== ownerChat) { cfg.telegramOwnerChatId = ownerChat; dirty = true; }
   // Google OAuth tokens as a JSON blob (copy from a local `--google-auth` run).
   if (process.env.GOOGLE_TOKENS && !cfg.googleTokens) {
     try { cfg.googleTokens = JSON.parse(process.env.GOOGLE_TOKENS); dirty = true; } catch {}
   }
   if (dirty) save("config", cfg);
+}
+
+// ── Daily briefing on the server ─────────────────────────────────────────────
+// Runs in-process on the always-on brain (a cron redeploy never executes), at
+// briefingTime in briefingTimezone, against the SERVER's data — the same data
+// the family's app reads. Delivers to every registered phone + Telegram owner.
+
+function msUntil(timeStr: string, tz: string): number {
+  const [h, m] = timeStr.split(":").map(Number);
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: tz, hourCycle: "h23", hour: "2-digit", minute: "2-digit", second: "2-digit",
+  }).formatToParts(new Date());
+  const get = (t: string) => Number(parts.find((p) => p.type === t)?.value ?? 0);
+  const nowSec = get("hour") * 3600 + get("minute") * 60 + get("second");
+  let delta = (h ?? 7) * 3600 + (m ?? 0) * 60 - nowSec;
+  if (delta <= 0) delta += 86400;
+  return delta * 1000;
+}
+
+async function runBriefingAndDeliver(client: Anthropic): Promise<string> {
+  const cfg = load<Config>("config", {});
+  const pushCount = Object.keys(load<Record<string, string>>("push", {})).length;
+  const hasTelegram = !!(cfg.telegramBotToken && cfg.telegramOwnerChatId);
+  if (!pushCount && !hasTelegram)
+    return "Skipped: no delivery targets (no registered phones, no Telegram owner).";
+  const history: Anthropic.MessageParam[] = [{ role: "user", content: MORNING_BRIEFING_TASK(cfg) }];
+  const result = await runAgentTurn(client, history, false);
+  const report: string[] = [];
+  if (pushCount) report.push(await sendExpoPush("Morning briefing", result));
+  if (hasTelegram) {
+    const r: any = await fetch(`https://api.telegram.org/bot${cfg.telegramBotToken}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: cfg.telegramOwnerChatId, text: result }),
+    }).then((x) => x.json());
+    report.push(r.ok ? "Telegram delivered." : `Telegram failed: ${JSON.stringify(r)}`);
+  }
+  return report.join(" ");
 }
 
 async function serveMode(client: Anthropic, cfg: Config, port: number) {
@@ -1195,6 +1240,11 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
         return send(200, { reply });
       }
 
+      // Manual "run the briefing now" — also how delivery gets tested end to end.
+      if (req.method === "POST" && url.pathname === "/briefing") {
+        return send(200, { report: await runBriefingAndDeliver(client) });
+      }
+
       if (req.method === "POST" && url.pathname === "/register-push") {
         const { sessionId = "default", pushToken } = JSON.parse((await readBody(req)) || "{}");
         if (!pushToken) return send(400, { error: "pushToken required" });
@@ -1214,8 +1264,23 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
     console.log(`Homebase brain serving on :${port}`);
     console.log(`  health:  GET  /health`);
     console.log(`  chat:    POST /chat  { sessionId, message }  (Bearer ${token})`);
+    console.log(`  brief:   POST /briefing  (run + deliver now)`);
     if (!process.env.HOMEBASE_SERVER_TOKEN) console.log(`\n  Auth token (set as HOMEBASE_SERVER_TOKEN on the app + Railway): ${token}`);
   });
+
+  // Daily briefing loop — reschedules after each run so DST shifts self-correct.
+  const briefTime = cfg.briefingTime ?? "07:00";
+  const briefTz = cfg.briefingTimezone ?? "America/New_York";
+  const briefTick = async () => {
+    try {
+      console.log(`[briefing] ${await runBriefingAndDeliver(client)}`);
+    } catch (err: any) {
+      console.error(`[briefing] failed: ${err.message}`);
+    }
+    setTimeout(briefTick, msUntil(briefTime, briefTz));
+  };
+  setTimeout(briefTick, msUntil(briefTime, briefTz));
+  console.log(`  daily briefing scheduled for ${briefTime} ${briefTz}`);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
