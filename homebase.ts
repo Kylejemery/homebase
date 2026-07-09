@@ -35,6 +35,10 @@ import { AsyncLocalStorage } from "async_hooks";
 // Which phone/session is driving the current agent turn — lets tools like
 // gmail_summary use the CALLER's personal credentials instead of household ones.
 const TURN_CTX = new AsyncLocalStorage<{ sessionId?: string }>();
+
+// Set once in main(); lets tool handlers (e.g. fetch_webpage's PDF reader) make
+// their own model calls without threading the client through every signature.
+let ANTHROPIC: Anthropic | null = null;
 import { randomUUID } from "crypto";
 
 // Keep in sync with package.json
@@ -832,6 +836,30 @@ const fetchWebTool: AgentTool = {
       });
       if (!res.ok) return `Couldn't open the page (HTTP ${res.status}).`;
       const type = res.headers.get("content-type") ?? "";
+      // PDFs (school flyers, event calendars): read via the model's native PDF support.
+      if (/application\/pdf/i.test(type) || /\.pdf(\?|$)/i.test(u.pathname)) {
+        if (!ANTHROPIC) return "PDF reading isn't available right now.";
+        const buf = Buffer.from(await res.arrayBuffer());
+        if (buf.byteLength > 10 * 1024 * 1024) return "That PDF is too large to read (over 10MB).";
+        const resp = await createWithRetry(ANTHROPIC, {
+          model: FAST_MODEL,
+          max_tokens: 1500,
+          messages: [
+            {
+              role: "user",
+              content: [
+                { type: "document", source: { type: "base64", media_type: "application/pdf", data: buf.toString("base64") } },
+                {
+                  type: "text",
+                  text: "Extract this document's content as plain text, prioritizing any dates, times, events, deadlines, and contact info. Be thorough but skip decorative fluff.",
+                },
+              ],
+            },
+          ],
+        });
+        const text = resp.content.filter((b): b is Anthropic.TextBlock => b.type === "text").map((b) => b.text).join("");
+        return text ? `[PDF contents]\n${text}` : "(couldn't read anything from that PDF)";
+      }
       if (!/text|html|xml|json/i.test(type)) return `That link is a ${type || "non-text"} file I can't read as text.`;
       const html = await res.text();
       const text = html
@@ -846,6 +874,58 @@ const fetchWebTool: AgentTool = {
     } catch (err: any) {
       return `Couldn't open the page: ${err.message}`;
     }
+  },
+};
+
+// ── Send email — from the CALLER's own Gmail (never the household account) ──
+
+const sendEmailTool: AgentTool = {
+  schema: {
+    name: "send_email",
+    description:
+      "Send an email from the asking person's own connected Gmail account. Draft it first, show the user " +
+      "the complete draft (to, subject, full body), and ONLY send after they explicitly approve — never " +
+      "send unprompted or with unapproved wording. Requires the person to have connected their email in " +
+      "the app (✉ button). Use manage_contacts / gmail_summary to find addresses when needed.",
+    input_schema: {
+      type: "object",
+      properties: {
+        to: { type: "string", description: "Recipient email address" },
+        subject: { type: "string" },
+        body: { type: "string", description: "Plain-text body" },
+        cc: { type: "string", description: "Optional CC address" },
+      },
+      required: ["to", "subject", "body"],
+    },
+  },
+  handler: async (input) => {
+    const sid = TURN_CTX.getStore()?.sessionId;
+    const token = sid ? await userAccessToken(sid) : null;
+    if (!token)
+      return "Sending needs your personal email connected — tap the ✉ button in the app first.";
+    const raw = [
+      `To: ${input.to}`,
+      ...(input.cc ? [`Cc: ${input.cc}`] : []),
+      `Subject: ${input.subject}`,
+      `Content-Type: text/plain; charset="UTF-8"`,
+      ``,
+      input.body,
+    ].join("\r\n");
+    const res = await fetch("https://gmail.googleapis.com/gmail/v1/users/me/messages/send", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        raw: Buffer.from(raw).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, ""),
+      }),
+    });
+    const data: any = await res.json();
+    if (!res.ok) {
+      return data.error?.status === "PERMISSION_DENIED" || data.error?.code === 403
+        ? "Your email connection doesn't have send permission yet — tap ✉ in the app to reconnect (the new consent includes sending)."
+        : `Send failed: ${data.error?.message ?? res.status}`;
+    }
+    logComm({ at: new Date().toISOString(), type: "email", direction: "out", party: input.to, summary: `${input.subject} — ${input.body.slice(0, 150)}` });
+    return `Email sent to ${input.to} (subject: "${input.subject}").`;
   },
 };
 
@@ -968,9 +1048,9 @@ const contactsTool: AgentTool = {
 
 interface CommEntry {
   at: string;
-  type: "call" | "sms";
+  type: "call" | "sms" | "email";
   direction: "in" | "out";
-  party: string; // the other number
+  party: string; // the other number or address
   summary: string;
 }
 
@@ -1334,8 +1414,8 @@ async function setupInboundAgent() {
 
 const TOOLS: AgentTool[] = [
   listsTool, calendarTool, memoryTool, weatherTool, filesTool,
-  gcalListTool, gcalAddTool, gmailTool, emailVipsTool, fetchWebTool, contactsTool, smsTool, phoneCallTool, checkCallTool,
-  commitmentsTool,
+  gcalListTool, gcalAddTool, gmailTool, sendEmailTool, emailVipsTool, fetchWebTool, contactsTool, smsTool,
+  phoneCallTool, checkCallTool, commitmentsTool,
 ];
 
 // ── MCP client — consume external MCP servers as extra agent tools ──────────
@@ -1436,6 +1516,9 @@ dates and offer to add them to the calendar (confirm before adding).
 CONFLICTS: when adding calendar events, watch for clashes — with existing events AND with known routines
 in family_memory habits — and mention them.
 TEXTS: you can send real SMS with send_sms. ALWAYS confirm the recipient and exact text with the user first.
+EMAIL SENDING: you can draft and send email from the asker's own Gmail (send_email). Show the FULL draft
+(to, subject, body) and send only after explicit approval. If they haven't connected their email (✉ in the
+app), tell them that's the first step.
 PHONE CALLS: you can place real calls with make_phone_call. Before calling, ALWAYS confirm with the user:
 the number, the goal, and exactly what personal info you may share (pull known facts from family_memory,
 ask for anything missing like DOB or insurance if the task needs it). After placing a call, tell the user
@@ -2336,7 +2419,7 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
             client_id: cfg.googleWebClientId,
             redirect_uri: `${cfg.publicUrl}/oauth/google/callback`,
             response_type: "code",
-            scope: "https://www.googleapis.com/auth/gmail.readonly",
+            scope: "https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.send",
             access_type: "offline",
             prompt: "consent",
             state,
@@ -2653,6 +2736,7 @@ async function main() {
   const serve = args.includes("--serve");
   const cfg = await getConfig(!serve); // non-interactive in serve mode (no stdin on Railway)
   const client = new Anthropic({ apiKey: cfg.apiKey });
+  ANTHROPIC = client;
   TOOLS.push(...(await connectMcpServers()));
 
   if (serve) {
