@@ -1234,6 +1234,15 @@ weather, important emails, commitments, restocked staples) → afternoon debrief
 early events, conflicts, emails with dates not on the calendar) → habit reflection ${cfg.reflectionTime ?? "21:30"}
 (silent). All delivered as push notifications and shown in the app's chat feed.
 
+CALL SCREENING: The household's AI phone line is ${cfg.twilioFromNumber ?? cfg.ownerCallback ?? "(not configured yet)"}.
+If asked how to forward/screen calls to it, give the right carrier codes and render EACH as a tappable dial
+button using this EXACT syntax (the app turns it into a button): {{dial:Label|code}}
+Use the household line's number in the codes. Standard GSM (AT&T / T-Mobile):
+  forward when unanswered {{dial:Forward missed calls|*61*<NUMBER>#}}, when busy {{dial:Forward when busy|*67*<NUMBER>#}},
+  when unreachable {{dial:Forward when off|*62*<NUMBER>#}}, cancel all {{dial:Turn off forwarding|##002#}}.
+Verizon: forward-no-answer is *71 then the number ({{dial:Forward missed calls|*7118887863104}}), cancel {{dial:Turn off forwarding|*73}}.
+If you don't know the caller's carrier, ask (AT&T/T-Mobile use the first set, Verizon the second). Recommend the
+"unanswered only" option so they still get calls normally and only missed ones reach the assistant.
 Resolve relative dates ("Saturday", "tomorrow") to ISO datetimes yourself before calling calendar tools.
 Proactively store useful facts in family_memory when people mention them.
 Be concise and practical — you're texting busy parents, not writing essays.
