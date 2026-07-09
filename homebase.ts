@@ -286,8 +286,11 @@ const calendarTool: AgentTool = {
   handler: async (input) => {
     const events = load<CalEvent[]>("calendar", []);
     const fmt = (e: CalEvent) => {
-      const d = new Date(e.start);
+      const d = new Date(e.start.length === 16 ? `${e.start}:00Z` : hasOffset(e.start) ? e.start : `${e.start}Z`);
+      // local-store times are naive household times; parse as UTC + format as UTC
+      // so the wall-clock time survives regardless of the server's own zone
       const when = d.toLocaleString("en-US", {
+        timeZone: hasOffset(e.start) ? HOUSEHOLD_TZ() : "UTC",
         weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit",
       });
       return `#${e.id} ${when} — ${e.title}${e.who ? ` (${e.who})` : ""}${e.notes ? ` — ${e.notes}` : ""}`;
@@ -571,10 +574,30 @@ async function googleConnect() {
 const GCAL_NOT_CONNECTED =
   "Google Calendar isn't connected (run: homebase --google-auth). Use the local manage_calendar tool instead.";
 
+// ── Household timezone handling ──────────────────────────────────────────────
+// The server runs in UTC (Railway); the family doesn't. Any datetime WITHOUT an
+// explicit offset ("2026-07-10T15:00") means household local time, and all
+// server-side formatting must render in the household zone.
+
+const HOUSEHOLD_TZ = () => load<Config>("config", {}).briefingTimezone ?? "America/New_York";
+const hasOffset = (s: string) => /Z$|[+-]\d{2}:\d{2}$/.test(s);
+
+// Google event time: pass offset-carrying strings through; give naive ones the
+// household timeZone so Google anchors them correctly (DST handled by Google).
+const gTime = (s: string) =>
+  hasOffset(s) ? { dateTime: s } : { dateTime: s.length === 16 ? `${s}:00` : s, timeZone: HOUSEHOLD_TZ() };
+
+// naive "YYYY-MM-DDTHH:MM[:SS]" + ms → naive string (for default end = start+1h)
+const naivePlus = (s: string, ms: number) =>
+  new Date(new Date(`${s.length === 16 ? `${s}:00` : s}Z`).getTime() + ms).toISOString().slice(0, 19);
+
 const gcalFmt = (e: any) => {
   const start = e.start?.dateTime ?? e.start?.date ?? "?";
   const when = e.start?.dateTime
-    ? new Date(e.start.dateTime).toLocaleString("en-US", { weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })
+    ? new Date(e.start.dateTime).toLocaleString("en-US", {
+        timeZone: HOUSEHOLD_TZ(), // server is UTC; briefings must speak household time
+        weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit",
+      })
     : `${start} (all day)`;
   return `${when} — ${e.summary ?? "(untitled)"}${e.location ? ` @ ${e.location}` : ""}`;
 };
@@ -664,9 +687,10 @@ const gcalAddTool: AgentTool = {
       body.start = { date: day };
       body.end = { date: next };
     } else {
-      const startMs = new Date(input.start).getTime();
-      body.start = { dateTime: new Date(startMs).toISOString() };
-      body.end = { dateTime: new Date(input.end ? new Date(input.end).getTime() : startMs + 3600000).toISOString() };
+      body.start = gTime(input.start);
+      body.end = input.end ? gTime(input.end) : gTime(hasOffset(input.start)
+        ? new Date(new Date(input.start).getTime() + 3600000).toISOString()
+        : naivePlus(input.start, 3600000));
     }
     // sendUpdates=all → Google emails real Accept/Decline invites to attendees
     const res = await fetch("https://www.googleapis.com/calendar/v3/calendars/primary/events?sendUpdates=all", {
@@ -2943,9 +2967,10 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
             body.start = { date: day };
             body.end = { date: next };
           } else {
-            const startMs = new Date(start).getTime();
-            body.start = { dateTime: new Date(startMs).toISOString() };
-            body.end = { dateTime: new Date(end ? new Date(end).getTime() : startMs + 3600000).toISOString() };
+            body.start = gTime(start);
+            body.end = end ? gTime(end) : gTime(hasOffset(start)
+              ? new Date(new Date(start).getTime() + 3600000).toISOString()
+              : naivePlus(start, 3600000));
           }
           const r = await fetch("https://www.googleapis.com/calendar/v3/calendars/primary/events", {
             method: "POST",
@@ -3027,9 +3052,10 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
         if (notes !== undefined) patch.location = notes;
         if (priv !== undefined) patch.visibility = priv ? "private" : "default";
         if (start) {
-          patch.start = { dateTime: new Date(start).toISOString() };
-          const endMs = end ? new Date(end).getTime() : new Date(start).getTime() + 3600000;
-          patch.end = { dateTime: new Date(endMs).toISOString() };
+          patch.start = gTime(start);
+          patch.end = end ? gTime(end) : gTime(hasOffset(start)
+            ? new Date(new Date(start).getTime() + 3600000).toISOString()
+            : naivePlus(start, 3600000));
         }
         const res = await fetch(
           `https://www.googleapis.com/calendar/v3/calendars/primary/events/${encodeURIComponent(id)}`,
