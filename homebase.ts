@@ -2949,22 +2949,40 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
         return send(200, { ok: true, source: "local" });
       }
 
-      // Home page payload: family profile, today at a glance, alerts, quick stats.
+      // Home page payload: family profile, what's AHEAD today (finished events
+      // drop off), tomorrow once evening hits, alerts, quick stats.
       if (req.method === "GET" && url.pathname === "/household") {
         const fam = load<Family>("family", { members: [] });
-        const todayStart = new Date();
-        todayStart.setHours(0, 0, 0, 0);
-        const eventsToday = await mergedCalendar(todayStart, 1);
+        const cfgNow = load<Config>("config", {});
+        const tz = cfgNow.briefingTimezone ?? "America/New_York";
+        const now = new Date();
+        // household-local date keys + hour (the server itself runs in UTC)
+        const dayKeyIn = (d: Date) => new Intl.DateTimeFormat("en-CA", { timeZone: tz }).format(d);
+        const todayKey = dayKeyIn(now);
+        const tomorrowKey = dayKeyIn(new Date(now.getTime() + 86400000));
+        const hourNow = Number(
+          new Intl.DateTimeFormat("en-US", { timeZone: tz, hourCycle: "h23", hour: "2-digit" }).format(now)
+        );
+        const all = await mergedCalendar(new Date(now.getTime() - 86400000), 3);
+        const notOver = (e: MergedEvent) => {
+          if (!e.start.includes("T")) return true; // all-day stays all day
+          const endMs = e.end?.includes("T") ? new Date(e.end).getTime() : new Date(e.start).getTime() + 3600000;
+          return endMs > now.getTime();
+        };
+        const eventsToday = all.filter((e) => e.start.slice(0, 10) === todayKey && notOver(e));
+        const evening = hourNow >= 17;
+        const eventsTomorrow =
+          evening || !eventsToday.length ? all.filter((e) => e.start.slice(0, 10) === tomorrowKey) : [];
         const lists = load<Lists>("lists", {});
         const openGrocery = (lists["grocery"] ?? []).filter((i) => !i.done).length;
-        const today = new Date().toISOString().slice(0, 10);
         const commitmentsDue = load<Commitment[]>("commitments", []).filter(
-          (c) => c.status === "open" && c.due && c.due <= today
+          (c) => c.status === "open" && c.due && c.due <= todayKey
         ).length;
         return send(200, {
           familyName: fam.name ?? null,
           members: fam.members,
           eventsToday,
+          eventsTomorrow,
           alerts: feedFor(undefined).filter((f) => !f.dismissed && ALERT_KINDS.has(f.kind ?? "")).slice(-5).reverse(),
           stats: { openGrocery, commitmentsDue },
         });
