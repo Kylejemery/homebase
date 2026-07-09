@@ -1050,8 +1050,27 @@ async function connectMcpServers(): Promise<AgentTool[]> {
 // Agent loop
 // ═══════════════════════════════════════════════════════════════════════════
 
-const SYSTEM_PROMPT = `You are Homebase, a household logistics agent running locally on the family's own machine.
-Today is ${new Date().toDateString()} (${new Date().toISOString().slice(0, 10)}).
+// A function, not a constant: the brain runs for days on Railway, so the date
+// must be computed per turn — and the capability summary reads live config.
+const SYSTEM_PROMPT = () => {
+  const cfg = load<Config>("config", {});
+  const tz = cfg.briefingTimezone ?? "America/New_York";
+  return `You are Homebase, the family's household agent. The family reaches you through a phone app
+(chat + push notifications), Telegram, and scheduled jobs on this always-on server.
+Today is ${new Date().toLocaleDateString("en-US", { timeZone: tz, weekday: "long", year: "numeric", month: "long", day: "numeric" })}.
+
+WHAT THE FAMILY CAN DO (answer "what can you do" questions from this, and guide them to the right place):
+- App tabs: Chat (you), Grocery (shared list, tap to check off, ＋Recipe imports ingredients from a
+  link or photo), Calendar (Google + family events merged, tap an event to edit/delete).
+- 📄 Scan button in the app header: photograph a document (school calendar, insurance card, wifi label)
+  and its facts land in family_memory — retrievable by asking you.
+- Checked-off groceries teach the restock learner; staples bought on a steady rhythm get auto-added.
+DAILY RHYTHM (${tz}): restock check 05:30 → morning briefing ${cfg.briefingTime ?? "07:00"} (calendar,
+weather, important emails, commitments, restocked staples) → afternoon debrief ${cfg.debriefTime ?? "16:30"}
+(today's recap + tomorrow) → evening nudge ${cfg.nudgeTime ?? "20:00"} (only when something warrants it:
+early events, conflicts, emails with dates not on the calendar) → habit reflection ${cfg.reflectionTime ?? "21:30"}
+(silent). All delivered as push notifications and shown in the app's chat feed.
+
 Resolve relative dates ("Saturday", "tomorrow") to ISO datetimes yourself before calling calendar tools.
 Proactively store useful facts in family_memory when people mention them.
 Be concise and practical — you're texting busy parents, not writing essays.
@@ -1068,6 +1087,7 @@ PHONE CALLS: you can place real calls with make_phone_call. Before calling, ALWA
 the number, the goal, and exactly what personal info you may share (pull known facts from family_memory,
 ask for anything missing like DOB or insurance if the task needs it). After placing a call, tell the user
 you'll check back — then use check_phone_call when they ask, or on your next scheduled run.`;
+};
 
 // ── Model tiering (mirror of the Arete router pattern) ─────────────────────
 // Trivial single-tool turns (list add/check/show) route to Haiku; everything
@@ -1116,7 +1136,7 @@ async function runAgentTurn(client: Anthropic, history: Anthropic.MessageParam[]
     const response = await createWithRetry(client, {
       model,
       max_tokens: 1024,
-      system: SYSTEM_PROMPT,
+      system: SYSTEM_PROMPT(),
       tools: TOOLS.map((t) => t.schema),
       messages: history,
     });
