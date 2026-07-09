@@ -1280,6 +1280,73 @@ const checkCallTool: AgentTool = {
   },
 };
 
+// ── Family profile — powers the app's Home page ─────────────────────────────
+
+interface FamilyMember {
+  name: string;
+  role?: string; // "mom", "kid", "dog"...
+  color: string;
+}
+interface Family {
+  name?: string; // "The Emery Family"
+  members: FamilyMember[];
+}
+
+const MEMBER_COLORS = ["#6c7dff", "#5dd39e", "#ffb454", "#ff6b9d", "#4dd0e1", "#b39ddb", "#ffd54f", "#81c784"];
+
+const familyTool: AgentTool = {
+  schema: {
+    name: "manage_family",
+    description:
+      "The family profile shown on the app's Home page. Actions: 'set_name' (e.g. \"The Emery Family\"), " +
+      "'add_member' (name + optional role like mom/dad/kid/dog), 'remove_member' (name), 'list'. " +
+      "Proactively add members as you learn who's in the household.",
+    input_schema: {
+      type: "object",
+      properties: {
+        action: { type: "string", enum: ["set_name", "add_member", "remove_member", "list"] },
+        name: { type: "string", description: "Family name (set_name) or member name" },
+        role: { type: "string", description: "Member role, e.g. 'mom', 'kid', 'dog' (optional)" },
+      },
+      required: ["action"],
+    },
+  },
+  handler: async (input) => {
+    const fam = load<Family>("family", { members: [] });
+    switch (input.action) {
+      case "set_name":
+        if (!input.name) return "Need the family name.";
+        fam.name = input.name.trim();
+        save("family", fam);
+        return `Family name set: ${fam.name}`;
+      case "add_member": {
+        if (!input.name) return "Need the member's name.";
+        if (fam.members.some((m) => m.name.toLowerCase() === input.name.toLowerCase().trim()))
+          return `${input.name} is already on the family page.`;
+        fam.members.push({
+          name: input.name.trim(),
+          role: input.role,
+          color: MEMBER_COLORS[fam.members.length % MEMBER_COLORS.length],
+        });
+        save("family", fam);
+        return `Added ${input.name}${input.role ? ` (${input.role})` : ""} to the family page.`;
+      }
+      case "remove_member": {
+        const before = fam.members.length;
+        fam.members = fam.members.filter((m) => m.name.toLowerCase() !== (input.name ?? "").toLowerCase().trim());
+        save("family", fam);
+        return before === fam.members.length ? `No member named "${input.name}".` : `Removed ${input.name}.`;
+      }
+      case "list":
+        return fam.members.length
+          ? `${fam.name ?? "(no family name set)"}\n` + fam.members.map((m) => `- ${m.name}${m.role ? ` (${m.role})` : ""}`).join("\n")
+          : "No family members added yet.";
+      default:
+        return "Unknown action.";
+    }
+  },
+};
+
 // ── Commitments — standing tasks with a due date or trigger condition ───────
 
 interface Commitment {
@@ -1415,7 +1482,7 @@ async function setupInboundAgent() {
 const TOOLS: AgentTool[] = [
   listsTool, calendarTool, memoryTool, weatherTool, filesTool,
   gcalListTool, gcalAddTool, gmailTool, sendEmailTool, emailVipsTool, fetchWebTool, contactsTool, smsTool,
-  phoneCallTool, checkCallTool, commitmentsTool,
+  phoneCallTool, checkCallTool, commitmentsTool, familyTool,
 ];
 
 // ── MCP client — consume external MCP servers as extra agent tools ──────────
@@ -1479,6 +1546,8 @@ WHAT THE FAMILY CAN DO (answer "what can you do" questions from this, and guide 
 - Checked-off groceries teach the restock learner; staples bought on a steady rhythm get auto-added.
 - You remember contacts (manage_contacts) — look up a saved number before calling/texting instead of
   asking again, and save new people automatically. When someone says "text/call <name>", find the contact first.
+- The app's Home page shows the family profile (manage_family: family name + members with roles). Add
+  members proactively as you learn who's in the household; suggest setting the family name if unset.
 - There's a communication log of every call and text. When the user asks to see their calls/texts/history,
   render a button to open it with this EXACT syntax: {{open:comms|View communication log}} (the app makes it tappable).
 DAILY RHYTHM (${tz}): restock check 05:30 → morning briefing ${cfg.briefingTime ?? "07:00"} (calendar,
@@ -1971,6 +2040,44 @@ function recordFeed(title: string, body: string, sessionId?: string) {
 
 const feedFor = (sessionId?: string) =>
   load<FeedItem[]>("feed", []).filter((f) => !f.sessionId || f.sessionId === sessionId);
+
+// Local + Google events for a window — the one calendar the whole household sees.
+type MergedEvent = { id: string; title: string; start: string; end?: string; who?: string; notes?: string; source: string };
+
+async function mergedCalendar(start: Date, days: number): Promise<MergedEvent[]> {
+  const horizon = new Date(start.getTime() + days * 86400000);
+  const events: MergedEvent[] = load<CalEvent[]>("calendar", [])
+    .filter((e) => new Date(e.start) >= start && new Date(e.start) <= horizon)
+    .map((e) => ({ id: String(e.id), title: e.title, start: e.start, end: e.end, who: e.who, notes: e.notes, source: "local" }));
+  const gtoken = await googleAccessToken();
+  if (gtoken) {
+    const g: any = await (
+      await fetch(
+        `https://www.googleapis.com/calendar/v3/calendars/primary/events?` +
+          new URLSearchParams({
+            timeMin: start.toISOString(),
+            timeMax: horizon.toISOString(),
+            singleEvents: "true",
+            orderBy: "startTime",
+            maxResults: "100",
+          }),
+        { headers: { Authorization: `Bearer ${gtoken}` } }
+      )
+    ).json();
+    for (const e of g.items ?? []) {
+      events.push({
+        id: String(e.id),
+        title: e.summary ?? "(untitled)",
+        start: e.start?.dateTime ?? e.start?.date ?? "",
+        end: e.end?.dateTime ?? e.end?.date,
+        notes: e.location,
+        source: "google",
+      });
+    }
+  }
+  events.sort((a, b) => a.start.localeCompare(b.start));
+  return events;
+}
 
 // Lightweight inbox fetch for personal digests (metadata only, ~12 messages).
 async function fetchInboxRows(token: string, hours: number): Promise<string[]> {
@@ -2557,38 +2664,65 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
       }
 
       if (req.method === "GET" && url.pathname === "/calendar") {
-        const days = Math.min(60, Number(url.searchParams.get("days")) || 14);
-        const now = new Date();
-        const horizon = new Date(now.getTime() + days * 86400000);
-        type Ev = { id: string; title: string; start: string; end?: string; who?: string; notes?: string; source: string };
-        const events: Ev[] = load<CalEvent[]>("calendar", [])
-          .filter((e) => new Date(e.start) >= new Date(now.getTime() - 86400000) && new Date(e.start) <= horizon)
-          .map((e) => ({ id: String(e.id), title: e.title, start: e.start, end: e.end, who: e.who, notes: e.notes, source: "local" }));
+        const days = Math.min(62, Number(url.searchParams.get("days")) || 14);
+        const from = url.searchParams.get("from"); // YYYY-MM-DD → month views
+        const start = from ? new Date(`${from}T00:00:00`) : new Date();
+        return send(200, { events: await mergedCalendar(start, days) });
+      }
+
+      // Add an event from the app's calendar form (Google when connected, else local).
+      if (req.method === "POST" && url.pathname === "/calendar/add") {
+        const { title, start, end, who, notes, allDay } = JSON.parse((await readBody(req)) || "{}");
+        if (!title || !start) return send(400, { error: "title and start required" });
         const gtoken = await googleAccessToken();
         if (gtoken) {
-          const g: any = await (
-            await fetch(
-              `https://www.googleapis.com/calendar/v3/calendars/primary/events?` +
-                new URLSearchParams({
-                  timeMin: now.toISOString(), timeMax: horizon.toISOString(),
-                  singleEvents: "true", orderBy: "startTime", maxResults: "50",
-                }),
-              { headers: { Authorization: `Bearer ${gtoken}` } }
-            )
-          ).json();
-          for (const e of g.items ?? []) {
-            events.push({
-              id: String(e.id),
-              title: e.summary ?? "(untitled)",
-              start: e.start?.dateTime ?? e.start?.date ?? "",
-              end: e.end?.dateTime ?? e.end?.date,
-              notes: e.location,
-              source: "google",
-            });
+          const body: any = { summary: title, location: notes };
+          if (allDay) {
+            const day = String(start).slice(0, 10);
+            const next = new Date(new Date(`${day}T00:00:00`).getTime() + 86400000).toISOString().slice(0, 10);
+            body.start = { date: day };
+            body.end = { date: next };
+          } else {
+            const startMs = new Date(start).getTime();
+            body.start = { dateTime: new Date(startMs).toISOString() };
+            body.end = { dateTime: new Date(end ? new Date(end).getTime() : startMs + 3600000).toISOString() };
           }
+          const r = await fetch("https://www.googleapis.com/calendar/v3/calendars/primary/events", {
+            method: "POST",
+            headers: { Authorization: `Bearer ${gtoken}`, "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+          });
+          const data: any = await r.json();
+          if (!r.ok) return send(r.status, { error: data.error?.message ?? "google add failed" });
+          return send(200, { ok: true, source: "google" });
         }
+        const events = load<CalEvent[]>("calendar", []);
+        const id = (events.at(-1)?.id ?? 0) + 1;
+        events.push({ id, title, start, end: end || undefined, who: who || undefined, notes: notes || undefined });
         events.sort((a, b) => a.start.localeCompare(b.start));
-        return send(200, { events });
+        save("calendar", events);
+        return send(200, { ok: true, source: "local" });
+      }
+
+      // Home page payload: family profile, today at a glance, alerts, quick stats.
+      if (req.method === "GET" && url.pathname === "/household") {
+        const fam = load<Family>("family", { members: [] });
+        const todayStart = new Date();
+        todayStart.setHours(0, 0, 0, 0);
+        const eventsToday = await mergedCalendar(todayStart, 1);
+        const lists = load<Lists>("lists", {});
+        const openGrocery = (lists["grocery"] ?? []).filter((i) => !i.done).length;
+        const today = new Date().toISOString().slice(0, 10);
+        const commitmentsDue = load<Commitment[]>("commitments", []).filter(
+          (c) => c.status === "open" && c.due && c.due <= today
+        ).length;
+        return send(200, {
+          familyName: fam.name ?? null,
+          members: fam.members,
+          eventsToday,
+          alerts: feedFor(undefined).slice(-5).reverse(),
+          stats: { openGrocery, commitmentsDue },
+        });
       }
 
       // Edit an event on either calendar. Google edits sync to the real calendar.
