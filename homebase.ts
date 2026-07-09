@@ -637,7 +637,10 @@ const gcalListTool: AgentTool = {
     if (!res.ok) return `Google Calendar error: ${data.error?.message ?? res.status}`;
     // private events never surface through the agent (briefings go to the whole family)
     const items = (data.items ?? []).filter((e: any) => e.visibility !== "private" && e.visibility !== "confidential");
-    return items.length ? items.map(gcalFmt).join("\n") : "Nothing on the Google calendar for that window.";
+    // include the event id so the agent can reference an event for google_calendar_update
+    return items.length
+      ? items.map((e: any) => `${gcalFmt(e)}  [id: ${e.id}]`).join("\n")
+      : "Nothing on the Google calendar for that window.";
   },
 };
 
@@ -726,6 +729,74 @@ const gcalAddTool: AgentTool = {
       if (clashes.length) out += `\n⚠ Possible conflict with: ${clashes.map(gcalFmt).join("; ")}`;
     }
     return out;
+  },
+};
+
+const gcalUpdateTool: AgentTool = {
+  schema: {
+    name: "google_calendar_update",
+    description:
+      "Edit an EXISTING event on the family's real Google Calendar (primary), by its event id. " +
+      "First find the event with google_calendar_list to get its id. Only include the fields you want " +
+      "to change — anything you omit stays exactly as it is. Use for reschedules (change start/end), " +
+      "renames (title), moving location, editing notes, or making an event private. Resolve relative " +
+      "dates ('move it to Saturday') to ISO datetimes first. ALWAYS confirm the change with the user " +
+      "before calling. If the event has attendees, they are automatically emailed the update.",
+    input_schema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "Google event id (from google_calendar_list)" },
+        title: { type: "string", description: "New title (optional)" },
+        start: { type: "string", description: "New start ISO datetime, e.g. 2026-07-11T15:00 (optional)" },
+        end: { type: "string", description: "New end ISO datetime (optional; defaults to start + 1 hour when start changes)" },
+        all_day: { type: "boolean", description: "Make it an all-day event (start is then YYYY-MM-DD)" },
+        location: { type: "string" },
+        notes: { type: "string" },
+        private: {
+          type: "boolean",
+          description:
+            "true = keep the event OFF all family surfaces (family calendar, Home, fridge, briefings); " +
+            "false = make it visible to the family again. Stays on the Google Calendar either way.",
+        },
+      },
+      required: ["id"],
+    },
+  },
+  handler: async (input) => {
+    const token = await googleAccessToken();
+    if (!token) return GCAL_NOT_CONNECTED;
+    const patch: any = {};
+    if (input.title !== undefined) patch.summary = input.title;
+    if (input.location !== undefined) patch.location = input.location;
+    if (input.notes !== undefined) patch.description = input.notes;
+    if (input.private !== undefined) patch.visibility = input.private ? "private" : "default";
+    if (input.all_day && input.start) {
+      const day = input.start.slice(0, 10);
+      const next = new Date(new Date(`${day}T00:00:00`).getTime() + 86400000).toISOString().slice(0, 10);
+      patch.start = { date: day };
+      patch.end = { date: next };
+    } else if (input.start) {
+      patch.start = gTime(input.start);
+      patch.end = input.end ? gTime(input.end) : gTime(hasOffset(input.start)
+        ? new Date(new Date(input.start).getTime() + 3600000).toISOString()
+        : naivePlus(input.start, 3600000));
+    } else if (input.end) {
+      patch.end = gTime(input.end);
+    }
+    if (Object.keys(patch).length === 0)
+      return "Nothing to change — specify at least one field (title, start, end, location, notes, private).";
+    // PATCH only touches the fields we send; sendUpdates=all notifies any attendees of the change
+    const res = await fetch(
+      `https://www.googleapis.com/calendar/v3/calendars/primary/events/${encodeURIComponent(input.id)}?sendUpdates=all`,
+      {
+        method: "PATCH",
+        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+        body: JSON.stringify(patch),
+      }
+    );
+    const data: any = await res.json().catch(() => ({}));
+    if (!res.ok) return `Google Calendar error: ${data.error?.message ?? res.status}`;
+    return `Updated on Google Calendar: ${gcalFmt(data)}${data.htmlLink ? `\n${data.htmlLink}` : ""}`;
   },
 };
 
@@ -1537,7 +1608,7 @@ async function setupInboundAgent() {
 
 const TOOLS: AgentTool[] = [
   listsTool, calendarTool, memoryTool, weatherTool, filesTool,
-  gcalListTool, gcalAddTool, gmailTool, sendEmailTool, emailVipsTool, fetchWebTool, contactsTool, smsTool,
+  gcalListTool, gcalAddTool, gcalUpdateTool, gmailTool, sendEmailTool, emailVipsTool, fetchWebTool, contactsTool, smsTool,
   phoneCallTool, checkCallTool, commitmentsTool, familyTool,
 ];
 
@@ -1646,6 +1717,10 @@ PRIVATE EVENTS: when someone asks to keep an event off the family calendar ("jus
 "private", "the family doesn't need to see this"), add it with private:true — it stays on their
 Google Calendar but never appears on family surfaces, briefings, or the fridge. Offer this when
 an event sounds personal (their own appointments, gifts, surprises).
+EDITING EVENTS: to change an existing appointment (reschedule, rename, move location, edit notes, make
+private), find it with google_calendar_list to get its [id], then call google_calendar_update with only the
+fields that change. Confirm the change with the user first. If the event has attendees, they're emailed the
+update automatically — so treat a reschedule like re-inviting: make sure the user is OK notifying them.
 INVITES: google_calendar_add with attendees sends real calendar invites by email. Treat like texts/calls:
 show the user who's being invited (names + emails) and the event details, and only send after explicit
 approval. Pull emails from manage_contacts; ask for and save missing ones.
