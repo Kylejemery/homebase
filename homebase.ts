@@ -30,6 +30,11 @@ import * as readline from "readline";
 import * as os from "os";
 import * as http from "http";
 import { exec } from "child_process";
+import { AsyncLocalStorage } from "async_hooks";
+
+// Which phone/session is driving the current agent turn — lets tools like
+// gmail_summary use the CALLER's personal credentials instead of household ones.
+const TURN_CTX = new AsyncLocalStorage<{ sessionId?: string }>();
 import { randomUUID } from "crypto";
 
 // Keep in sync with package.json
@@ -92,6 +97,12 @@ interface Config {
   googleClientId?: string;
   googleClientSecret?: string;
   googleTokens?: { access_token: string; refresh_token?: string; expires_at?: number };
+  // Separate WEB-type OAuth client for per-person email connects from the app
+  // (desktop clients can't use an https redirect). Redirect URI to register:
+  // https://<your-server-domain>/oauth/google/callback
+  googleWebClientId?: string;
+  googleWebClientSecret?: string;
+  publicUrl?: string; // https origin of this server (defaults to RAILWAY_PUBLIC_DOMAIN)
   haikuRouting?: boolean; // false disables fast-model routing of trivial turns
   mcpServers?: { name: string; command: string; args?: string[] }[];
   serverToken?: string; // shared secret the mobile app sends to the --serve brain
@@ -455,6 +466,37 @@ async function googleAccessToken(): Promise<string | null> {
   return data.access_token;
 }
 
+// ── Per-person Google tokens (personal email) ───────────────────────────────
+// Keyed by the phone's sessionId; connected via the in-app browser OAuth flow.
+// Personal tokens carry gmail.readonly only — the household calendar stays on
+// the household-level connection.
+
+type GTokens = { access_token: string; refresh_token?: string; expires_at?: number };
+
+async function userAccessToken(sessionId: string): Promise<string | null> {
+  const users = load<Record<string, GTokens>>("google-users", {});
+  const t = users[sessionId];
+  if (!t) return null;
+  if (t.expires_at && Date.now() < t.expires_at - 60_000) return t.access_token;
+  const cfg = load<Config>("config", {});
+  if (!t.refresh_token || !cfg.googleWebClientId || !cfg.googleWebClientSecret) return null;
+  const res = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      client_id: cfg.googleWebClientId,
+      client_secret: cfg.googleWebClientSecret,
+      refresh_token: t.refresh_token,
+      grant_type: "refresh_token",
+    }),
+  });
+  const data: any = await res.json();
+  if (!res.ok) return null;
+  users[sessionId] = { ...t, access_token: data.access_token, expires_at: Date.now() + (data.expires_in ?? 3600) * 1000 };
+  save("google-users", users);
+  return data.access_token;
+}
+
 async function googleConnect() {
   const cfg = load<Config>("config", {});
   if (!cfg.googleClientId || !cfg.googleClientSecret) {
@@ -659,8 +701,11 @@ const gmailTool: AgentTool = {
     },
   },
   handler: async (input) => {
-    const token = await googleAccessToken();
-    if (!token) return "Gmail isn't connected. Re-run: homebase --google-auth (approve the Gmail read-only scope).";
+    // The caller's own inbox when they've connected one; household connection otherwise.
+    const sid = TURN_CTX.getStore()?.sessionId;
+    const token = (sid ? await userAccessToken(sid) : null) ?? (await googleAccessToken());
+    if (!token)
+      return "No email connected. Connect a personal inbox from the app (✉ button), or the household one via: homebase --google-auth";
     const hours = input.hours ?? 24;
     const q = `in:inbox -category:promotions -category:social newer_than:${Math.max(1, Math.ceil(hours / 24))}d${input.query ? ` ${input.query}` : ""}`;
     const list: any = await (
@@ -1262,8 +1307,13 @@ ${transcript}`;
 // Deliver a message to every phone that registered via /register-push. Expo's
 // push API needs no key for sends; returns per-message tickets. Used by the
 // morning briefing (and available for call followups) so the app gets notified.
-async function sendExpoPush(title: string, body: string): Promise<string> {
-  const tokens = Object.values(load<Record<string, string>>("push", {}));
+async function sendExpoPush(title: string, body: string, onlySessionId?: string): Promise<string> {
+  const registry = load<Record<string, string>>("push", {});
+  const tokens = onlySessionId
+    ? registry[onlySessionId]
+      ? [registry[onlySessionId]]
+      : []
+    : Object.values(registry);
   if (!tokens.length) return "No registered push tokens.";
   const messages = tokens.map((to) => ({ to, title, body, sound: "default" }));
   const res = await fetch("https://exp.host/--/api/v2/push/send", {
@@ -1439,6 +1489,9 @@ function hydrateConfigFromEnv(cfg: Config) {
     ["googleClientId", process.env.GOOGLE_CLIENT_ID],
     ["googleClientSecret", process.env.GOOGLE_CLIENT_SECRET],
     ["telegramBotToken", process.env.TELEGRAM_BOT_TOKEN],
+    ["googleWebClientId", process.env.GOOGLE_WEB_CLIENT_ID],
+    ["googleWebClientSecret", process.env.GOOGLE_WEB_CLIENT_SECRET],
+    ["publicUrl", process.env.PUBLIC_URL ?? (process.env.RAILWAY_PUBLIC_DOMAIN ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` : undefined)],
     ["briefingTime", process.env.BRIEFING_TIME],
     ["briefingTimezone", process.env.BRIEFING_TZ],
     ["debriefTime", process.env.DEBRIEF_TIME],
@@ -1505,6 +1558,8 @@ async function runBriefingAndDeliver(client: Anthropic, kind: "morning" | "debri
     }).then((x) => x.json());
     report.push(r.ok ? "Telegram delivered." : `Telegram failed: ${JSON.stringify(r)}`);
   }
+  const personal = await deliverPersonalEmailDigests(client, kind);
+  if (personal) report.push(`${personal} personal inbox digest(s).`);
   return report.join(" ");
 }
 
@@ -1514,12 +1569,74 @@ interface FeedItem {
   at: string;
   title: string;
   body: string;
+  sessionId?: string; // present = personal (one phone only); absent = household-wide
 }
 
-function recordFeed(title: string, body: string) {
+function recordFeed(title: string, body: string, sessionId?: string) {
   const feed = load<FeedItem[]>("feed", []);
-  feed.push({ at: new Date().toISOString(), title, body });
-  save("feed", feed.slice(-50));
+  feed.push({ at: new Date().toISOString(), title, body, ...(sessionId ? { sessionId } : {}) });
+  save("feed", feed.slice(-80));
+}
+
+const feedFor = (sessionId?: string) =>
+  load<FeedItem[]>("feed", []).filter((f) => !f.sessionId || f.sessionId === sessionId);
+
+// Lightweight inbox fetch for personal digests (metadata only, ~12 messages).
+async function fetchInboxRows(token: string, hours: number): Promise<string[]> {
+  const q = `in:inbox -category:promotions -category:social newer_than:${Math.max(1, Math.ceil(hours / 24))}d`;
+  const list: any = await (
+    await fetch(
+      `https://gmail.googleapis.com/gmail/v1/users/me/messages?` + new URLSearchParams({ q, maxResults: "12" }),
+      { headers: { Authorization: `Bearer ${token}` } }
+    )
+  ).json();
+  const ids: string[] = (list.messages ?? []).map((m: any) => m.id);
+  const rows: string[] = [];
+  for (const id of ids) {
+    const msg: any = await (
+      await fetch(
+        `https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}?format=metadata&metadataHeaders=From&metadataHeaders=Subject`,
+        { headers: { Authorization: `Bearer ${token}` } }
+      )
+    ).json();
+    const h = (n: string) => msg.payload?.headers?.find((x: any) => x.name.toLowerCase() === n.toLowerCase())?.value ?? "";
+    rows.push(`FROM ${h("From").replace(/<.*>/, "").trim()} — ${h("Subject")}${msg.snippet ? ` — ${String(msg.snippet).slice(0, 120)}` : ""}`);
+  }
+  return rows;
+}
+
+// Personal inbox digests ride along with each briefing: every phone that
+// connected its own email gets a private "Your inbox" push — recorded in the
+// feed as a personal item, invisible to the rest of the household.
+async function deliverPersonalEmailDigests(client: Anthropic, kind: "morning" | "debrief"): Promise<number> {
+  const users = load<Record<string, GTokens>>("google-users", {});
+  const pushReg = load<Record<string, string>>("push", {});
+  let delivered = 0;
+  for (const sessionId of Object.keys(users)) {
+    if (!pushReg[sessionId]) continue;
+    try {
+      const token = await userAccessToken(sessionId);
+      if (!token) continue;
+      const rows = await fetchInboxRows(token, kind === "debrief" ? 10 : 24);
+      if (!rows.length) continue;
+      const resp = await createWithRetry(client, {
+        model: FAST_MODEL,
+        max_tokens: 500,
+        messages: [
+          {
+            role: "user",
+            content: `From these inbox emails, write a 2-4 line personal digest covering ONLY the ones that matter (skip newsletters, promos, receipts, routine notifications). If nothing matters, reply with exactly the single word NOTHING.\n\n${rows.join("\n")}`,
+          },
+        ],
+      });
+      const text = resp.content.filter((b): b is Anthropic.TextBlock => b.type === "text").map((b) => b.text).join("").trim();
+      if (!text || /^NOTHING\b/i.test(text)) continue;
+      recordFeed("Your inbox", text, sessionId);
+      await sendExpoPush("Your inbox", text, sessionId);
+      delivered++;
+    } catch {}
+  }
+  return delivered;
 }
 
 // Evening nudge: runs the look-ahead scan; delivers only when the agent found
@@ -1773,6 +1890,7 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
   );
   const saveSessions = () => save("sessions", Object.fromEntries(sessions));
   const pendingNotes = new Map<string, string[]>(); // call outcomes awaiting the session's next turn
+  const pendingOAuth = new Map<string, { sessionId: string; at: number }>(); // state → phone, 10-min TTL
 
   const server = http.createServer(async (req, res) => {
     const send = (code: number, obj: unknown) => {
@@ -1784,7 +1902,70 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
       if (req.method === "OPTIONS") return send(204, {});
       if (req.method === "GET" && url.pathname === "/health") return send(200, { ok: true, version: VERSION });
 
+      // Browser lands here from Google — no bearer header, so it lives above the
+      // auth gate; the one-time `state` (minted by the authed /init) is the auth.
+      if (req.method === "GET" && url.pathname === "/oauth/google/callback") {
+        const html = (msg: string) => {
+          res.writeHead(200, { "Content-Type": "text/html" });
+          res.end(`<div style="font-family:sans-serif;padding:40px;text-align:center"><h2>${msg}</h2></div>`);
+        };
+        const state = url.searchParams.get("state") ?? "";
+        const code = url.searchParams.get("code");
+        const pending = pendingOAuth.get(state);
+        pendingOAuth.delete(state);
+        if (!pending || Date.now() - pending.at > 600_000) return html("This connect link expired — start again from the app.");
+        if (!code) return html(`Google said: ${url.searchParams.get("error") ?? "no code"}`);
+        const cfg = load<Config>("config", {});
+        const r = await fetch("https://oauth2.googleapis.com/token", {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: new URLSearchParams({
+            client_id: cfg.googleWebClientId!,
+            client_secret: cfg.googleWebClientSecret!,
+            code,
+            redirect_uri: `${cfg.publicUrl}/oauth/google/callback`,
+            grant_type: "authorization_code",
+          }),
+        });
+        const tok: any = await r.json();
+        if (!r.ok) return html(`Token exchange failed: ${tok.error_description ?? tok.error ?? r.status}`);
+        const users = load<Record<string, GTokens>>("google-users", {});
+        users[pending.sessionId] = {
+          access_token: tok.access_token,
+          refresh_token: tok.refresh_token,
+          expires_at: Date.now() + (tok.expires_in ?? 3600) * 1000,
+        };
+        save("google-users", users);
+        return html("✅ Your email is connected to Homebase on this phone only. You can close this tab.");
+      }
+
       if ((req.headers.authorization ?? "") !== `Bearer ${token}`) return send(401, { error: "unauthorized" });
+
+      // Mint a personal-email connect URL for this phone (10-min single-use state).
+      if (req.method === "POST" && url.pathname === "/oauth/google/init") {
+        const { sessionId } = JSON.parse((await readBody(req)) || "{}");
+        if (!sessionId) return send(400, { error: "sessionId required" });
+        const cfg = load<Config>("config", {});
+        if (!cfg.googleWebClientId || !cfg.googleWebClientSecret || !cfg.publicUrl)
+          return send(400, {
+            error:
+              "Personal email connect isn't configured. Server needs GOOGLE_WEB_CLIENT_ID, GOOGLE_WEB_CLIENT_SECRET (a Web-type OAuth client with redirect URI <server>/oauth/google/callback), and a public URL.",
+          });
+        const state = randomUUID();
+        pendingOAuth.set(state, { sessionId, at: Date.now() });
+        const authUrl =
+          "https://accounts.google.com/o/oauth2/v2/auth?" +
+          new URLSearchParams({
+            client_id: cfg.googleWebClientId,
+            redirect_uri: `${cfg.publicUrl}/oauth/google/callback`,
+            response_type: "code",
+            scope: "https://www.googleapis.com/auth/gmail.readonly",
+            access_type: "offline",
+            prompt: "consent",
+            state,
+          });
+        return send(200, { url: authUrl });
+      }
 
       if (req.method === "POST" && url.pathname === "/chat") {
         const { sessionId = "default", message } = JSON.parse((await readBody(req)) || "{}");
@@ -1798,12 +1979,12 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
         if (notes?.length) prefixes.push(`[system note — completed call outcome: ${notes.join(" | ")}]`);
         // Give the agent the notifications this session hasn't discussed yet, so
         // "yes, add that one" after a nudge/briefing has something to refer to.
-        const feed = load<FeedItem[]>("feed", []);
+        const feed = feedFor(sessionId);
         const reads = load<Record<string, string>>("feed-read", {});
         const unread = feed.filter((f) => f.at > (reads[sessionId] ?? "")).slice(-3);
         if (unread.length) {
           prefixes.push(
-            `[system note — notifications recently sent to the family: ${unread.map((f) => `${f.title}: ${f.body.slice(0, 400)}`).join(" ||| ")}]`
+            `[system note — notifications recently sent: ${unread.map((f) => `${f.title}: ${f.body.slice(0, 400)}`).join(" ||| ")}]`
           );
           reads[sessionId] = feed.at(-1)!.at;
           save("feed-read", reads);
@@ -1812,7 +1993,7 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
           role: "user",
           content: prefixes.length ? `${prefixes.join("\n")}\n${message}` : message,
         });
-        const reply = await runAgentTurn(client, history, false);
+        const reply = await TURN_CTX.run({ sessionId }, () => runAgentTurn(client, history, false));
         trimHistory(history);
         saveSessions();
         // Call outcomes go out as push notifications and surface as a note on the
@@ -1857,8 +2038,10 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
       }
 
       // Notification history — the app shows these inline in the chat feed.
+      // Household items for everyone; personal items only to their own phone.
       if (req.method === "GET" && url.pathname === "/feed") {
-        return send(200, { items: load<FeedItem[]>("feed", []).slice(-20) });
+        const sid = url.searchParams.get("sessionId") ?? undefined;
+        return send(200, { items: feedFor(sid).slice(-20) });
       }
 
       // ── Structured data for the app's Grocery + Calendar screens ──────────
