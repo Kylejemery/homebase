@@ -2372,6 +2372,42 @@ function runRestock(): string {
   return added.length ? `Restocked: ${added.join(", ")}` : "No restock due.";
 }
 
+// Photo of any printed list (school supply sheet, packing list, team snack
+// signup) → items. Generic sibling of the recipe extractor.
+async function extractListItems(
+  client: Anthropic,
+  input: { image: string; mediaType?: string; hint?: string }
+): Promise<string[]> {
+  const resp = await createWithRetry(client, {
+    model: FAST_MODEL,
+    max_tokens: 1200,
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "image", source: { type: "base64", media_type: (input.mediaType as any) ?? "image/jpeg", data: input.image } },
+          {
+            type: "text",
+            text:
+              `This photo shows a list of items (school supply list, packing list, signup sheet, etc.).` +
+              `${input.hint ? ` The user says: "${input.hint}".` : ""} Extract every item as a JSON array of ` +
+              `strings, keeping quantities (e.g. "24 #2 pencils"). Reply with ONLY the JSON array. ` +
+              `If there's no list in the photo, reply [].`,
+          },
+        ],
+      },
+    ],
+  });
+  const text = resp.content.filter((b): b is Anthropic.TextBlock => b.type === "text").map((b) => b.text).join("");
+  const match = text.match(/\[[\s\S]*\]/);
+  if (!match) return [];
+  try {
+    return (JSON.parse(match[0]) as unknown[]).map((x) => String(x).trim()).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
 function addToList(listName: string, items: string[]): { id: number; item: string }[] {
   const lists = load<Lists>("lists", {});
   lists[listName] ??= [];
@@ -2966,6 +3002,16 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
         const ingredients = await extractIngredients(client, body);
         if (!ingredients.length) return send(200, { added: [], message: "No ingredients found — is that a recipe?" });
         const added = addToList(body.list ? String(body.list).toLowerCase() : "grocery", ingredients);
+        return send(200, { added });
+      }
+
+      // List scan: photo of a printed list → items into a named list.
+      if (req.method === "POST" && url.pathname === "/list-scan") {
+        const body = JSON.parse((await readBody(req)) || "{}");
+        if (!body.image) return send(400, { error: "image required" });
+        const items = await extractListItems(client, body);
+        if (!items.length) return send(200, { added: [], message: "Couldn't find list items in that photo." });
+        const added = addToList(body.list ? String(body.list).toLowerCase() : "grocery", items);
         return send(200, { added });
       }
 
