@@ -1540,8 +1540,10 @@ const SYSTEM_PROMPT = () => {
 Today is ${new Date().toLocaleDateString("en-US", { timeZone: tz, weekday: "long", year: "numeric", month: "long", day: "numeric" })}.
 
 WHAT THE FAMILY CAN DO (answer "what can you do" questions from this, and guide them to the right place):
-- App tabs: Chat (you), Grocery (shared list, tap to check off, ＋Recipe imports ingredients from a
-  link or photo), Calendar (Google + family events merged, tap an event to edit/delete).
+- App tabs: Home (family cover page with today, alerts, stats), Chat (you), Lists (grocery first plus
+  any named list — school supplies, packing…; tap crosses out, double-tap deletes; ＋Recipe imports
+  ingredients; 📷 Scan photographs any printed list into items), Calendar (month grid, Google + family
+  merged, tap a day, tap an event to edit, ＋ to add).
 - 📄 Scan button in the app header: photograph a document (school calendar, insurance card, wifi label)
   and its facts land in family_memory — retrievable by asking you.
 - Checked-off groceries teach the restock learner; staples bought on a steady rhythm get auto-added.
