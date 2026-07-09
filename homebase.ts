@@ -761,6 +761,55 @@ function gmailPlainText(payload: any): string {
   return "";
 }
 
+// ── Email VIPs — senders that trigger an immediate alert ────────────────────
+// Per-phone lists (the person who says "the school is important" gets the
+// alerts). A 10-minute watcher checks each person's inbox for new VIP mail.
+
+const emailVipsTool: AgentTool = {
+  schema: {
+    name: "manage_email_vips",
+    description:
+      "The user's important-sender list: email from these senders triggers an immediate push alert " +
+      "(checked every ~10 minutes). Use when the user says things like 'alert me when the kids' school " +
+      "emails' or 'emails from the dance studio are important'. A sender can be an address, a domain, " +
+      "or a name (e.g. 'notifications@school.org', 'school.org', 'Miss Amy Dance'). " +
+      "Actions: 'add', 'list', 'remove'. Lists are personal to whoever is asking.",
+    input_schema: {
+      type: "object",
+      properties: {
+        action: { type: "string", enum: ["add", "list", "remove"] },
+        sender: { type: "string", description: "Address, domain, or sender name" },
+      },
+      required: ["action"],
+    },
+  },
+  handler: async (input) => {
+    const sid = TURN_CTX.getStore()?.sessionId ?? "household";
+    const vips = load<Record<string, string[]>>("email-vips", {});
+    vips[sid] ??= [];
+    switch (input.action) {
+      case "add": {
+        if (!input.sender) return "Need the sender to watch for.";
+        const s = input.sender.trim();
+        if (!vips[sid].some((x) => x.toLowerCase() === s.toLowerCase())) vips[sid].push(s);
+        save("email-vips", vips);
+        return `Watching for email from "${s}" — you'll get an alert within ~10 minutes of one arriving.`;
+      }
+      case "list":
+        return vips[sid].length ? `Watching: ${vips[sid].join(", ")}` : "No VIP senders yet.";
+      case "remove": {
+        if (!input.sender) return "Which sender should I stop watching?";
+        const before = vips[sid].length;
+        vips[sid] = vips[sid].filter((x) => x.toLowerCase() !== input.sender.trim().toLowerCase());
+        save("email-vips", vips);
+        return before === vips[sid].length ? `"${input.sender}" wasn't on the list.` : `Stopped watching "${input.sender}".`;
+      }
+      default:
+        return "Unknown action.";
+    }
+  },
+};
+
 // ── SMS via Twilio — the agent texts family members or anyone else ──────────
 
 const smsTool: AgentTool = {
@@ -1047,7 +1096,7 @@ const commitmentsTool: AgentTool = {
 
 const TOOLS: AgentTool[] = [
   listsTool, calendarTool, memoryTool, weatherTool, filesTool,
-  gcalListTool, gcalAddTool, gmailTool, smsTool, phoneCallTool, checkCallTool,
+  gcalListTool, gcalAddTool, gmailTool, emailVipsTool, smsTool, phoneCallTool, checkCallTool,
   commitmentsTool,
 ];
 
@@ -1125,6 +1174,8 @@ the whole chain without re-asking between steps, and report each step's outcome 
 FOLLOW-UPS: when the user asks for a future or conditional follow-up ("call them Tuesday if X hasn't happened"),
 store it with manage_commitments so the daily briefings can surface it. Never act on a stored commitment
 without asking first.
+EMAIL VIPs: when the user says a sender matters ("alert me when the school emails"), store it with
+manage_email_vips — they'll get a push alert within ~10 minutes of that sender's next email.
 CONFLICTS: when adding calendar events, watch for clashes — with existing events AND with known routines
 in family_memory habits — and mention them.
 TEXTS: you can send real SMS with send_sms. ALWAYS confirm the recipient and exact text with the user first.
@@ -1637,6 +1688,47 @@ async function deliverPersonalEmailDigests(client: Anthropic, kind: "morning" | 
     } catch {}
   }
   return delivered;
+}
+
+// VIP watcher: every ~10 min, check each person's inbox for new mail from their
+// important senders and push an alert to their phone only. No model calls —
+// a plain Gmail search from the last checkpoint forward.
+async function checkVipEmails(): Promise<void> {
+  const vips = load<Record<string, string[]>>("email-vips", {});
+  const lastChecks = load<Record<string, number>>("vip-last-check", {});
+  let dirty = false;
+  for (const [sid, senders] of Object.entries(vips)) {
+    if (!senders.length) continue;
+    try {
+      // Personal inbox when connected; the household connection as fallback.
+      const token = (await userAccessToken(sid)) ?? (await googleAccessToken());
+      if (!token) continue;
+      const since = lastChecks[sid] ?? Date.now() - 3600_000;
+      const q = `in:inbox after:${Math.floor(since / 1000)} (${senders.map((s) => `from:"${s}"`).join(" OR ")})`;
+      const list: any = await (
+        await fetch(
+          `https://gmail.googleapis.com/gmail/v1/users/me/messages?` + new URLSearchParams({ q, maxResults: "5" }),
+          { headers: { Authorization: `Bearer ${token}` } }
+        )
+      ).json();
+      lastChecks[sid] = Date.now();
+      dirty = true;
+      for (const m of list.messages ?? []) {
+        const msg: any = await (
+          await fetch(
+            `https://gmail.googleapis.com/gmail/v1/users/me/messages/${m.id}?format=metadata&metadataHeaders=From&metadataHeaders=Subject`,
+            { headers: { Authorization: `Bearer ${token}` } }
+          )
+        ).json();
+        const h = (n: string) => msg.payload?.headers?.find((x: any) => x.name.toLowerCase() === n.toLowerCase())?.value ?? "";
+        const from = h("From").replace(/<.*>/, "").trim();
+        const body = `${from}: ${h("Subject")}${msg.snippet ? `\n${String(msg.snippet).slice(0, 160)}` : ""}`;
+        recordFeed("📬 Important email", body, sid === "household" ? undefined : sid);
+        await sendExpoPush("📬 Important email", body, sid === "household" ? undefined : sid);
+      }
+    } catch {}
+  }
+  if (dirty) save("vip-last-check", lastChecks);
 }
 
 // Evening nudge: runs the look-ahead scan; delivers only when the agent found
@@ -2238,6 +2330,10 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
     setTimeout(tick, msUntil(timeStr, briefTz));
     console.log(`  ${label} scheduled daily at ${timeStr} ${briefTz}`);
   };
+  // VIP email watcher — the one job on an interval rather than a daily clock.
+  setInterval(() => checkVipEmails().catch(() => {}), 10 * 60 * 1000);
+  console.log("  VIP email watcher running every 10 min");
+
   daily("restock check", "05:30", async () => runRestock()); // before the briefing so it can announce
   daily("morning briefing", cfg.briefingTime ?? "07:00", () => runBriefingAndDeliver(client, "morning"));
   daily("afternoon debrief", cfg.debriefTime ?? "16:30", () => runBriefingAndDeliver(client, "debrief"));
