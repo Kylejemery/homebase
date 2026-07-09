@@ -2031,6 +2031,7 @@ interface FeedItem {
   title: string;
   body: string;
   sessionId?: string; // present = personal (one phone only); absent = household-wide
+  dismissed?: boolean; // checked off on the Home page — hidden from alert surfaces
 }
 
 function recordFeed(title: string, body: string, sessionId?: string) {
@@ -2645,7 +2646,7 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
             events: await mergedCalendar(todayStart, 30),
             grocery: (lists["grocery"] ?? []).filter((i) => !i.done),
             weather: await displayWeather(),
-            alerts: feedFor(undefined).slice(-3).reverse(),
+            alerts: feedFor(undefined).filter((f) => !f.dismissed).slice(-3).reverse(),
           });
         }
 
@@ -2771,6 +2772,17 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
         return send(200, { items: feedFor(sid).slice(-20) });
       }
 
+      // Check off a family alert — household-wide (handled is handled for everyone).
+      if (req.method === "POST" && url.pathname === "/feed/dismiss") {
+        const { at } = JSON.parse((await readBody(req)) || "{}");
+        const feed = load<FeedItem[]>("feed", []);
+        const item = feed.find((f) => f.at === at);
+        if (!item) return send(404, { error: "no such alert" });
+        item.dismissed = true;
+        save("feed", feed);
+        return send(200, { ok: true });
+      }
+
       // Communication log — calls + texts, in and out, newest first (comms screen).
       if (req.method === "GET" && url.pathname === "/communications") {
         return send(200, { items: load<CommEntry[]>("comms", []).slice(-100).reverse() });
@@ -2880,7 +2892,7 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
           familyName: fam.name ?? null,
           members: fam.members,
           eventsToday,
-          alerts: feedFor(undefined).slice(-5).reverse(),
+          alerts: feedFor(undefined).filter((f) => !f.dismissed).slice(-5).reverse(),
           stats: { openGrocery, commitmentsDue },
         });
       }
