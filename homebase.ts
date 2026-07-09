@@ -51,6 +51,7 @@ Usage:
   homebase --telegram            Telegram bot mode — family texts the agent
   homebase --serve               HTTP brain for the mobile app (PORT env or 8080)
   homebase --google-auth         connect Google Calendar (one-time OAuth in your browser)
+  homebase --setup-inbound       AI receptionist answers the household number (after Twilio import)
   homebase --version, -v         print version
   homebase --help, -h            show this help
 
@@ -1094,6 +1095,74 @@ const commitmentsTool: AgentTool = {
   },
 };
 
+// ── Inbound receptionist (Vapi) — the AI that ANSWERS the household number ──
+// One-time setup after importing a Twilio number into Vapi: `--setup-inbound`
+// creates a persistent assistant, points its end-of-call reports at this
+// server's /vapi/webhook, and assigns it to the number.
+
+const INBOUND_AGENT_PROMPT = (cfg: Config) => `
+You are the friendly AI receptionist answering ${cfg.ownerName ?? "the family"}'s household line.
+
+RULES:
+- Greet callers warmly and disclose you're an AI assistant taking calls for ${cfg.ownerName ?? "the family"}.
+- Your job: find out who's calling, what it's about, and take a complete message (name, reason,
+  callback number). Confirm the message back briefly.
+- NEVER share family information — schedules, addresses, who's home, phone numbers, anything.
+  You take messages; you don't give out details.
+- If the caller says it's URGENT or asks to speak to ${cfg.ownerName ?? "the owner"} directly, offer to
+  transfer them${cfg.ownerCallback ? " and use the transferCall tool" : ""}. Otherwise assure them the
+  message will be delivered right away (it is — the family gets an instant summary).
+- Sales/robocalls: politely decline and end the call.
+- Be warm and brief. Use endCall when the conversation is complete.
+`.trim();
+
+async function setupInboundAgent() {
+  const cfg = load<Config>("config", {});
+  hydrateConfigFromEnv(cfg);
+  const token = process.env.HOMEBASE_SERVER_TOKEN || cfg.serverToken;
+  if (!cfg.vapiApiKey || !cfg.vapiPhoneNumberId)
+    return console.error("Needs vapiApiKey + vapiPhoneNumberId configured first.");
+  if (!cfg.publicUrl || !token)
+    return console.error("Needs the server's publicUrl + server token (deploy the brain first) so call reports can flow back.");
+
+  const tools: any[] = [{ type: "endCall" }];
+  if (cfg.ownerCallback)
+    tools.push({
+      type: "transferCall",
+      destinations: [{ type: "number", number: cfg.ownerCallback, message: "Connecting you now — one moment." }],
+    });
+
+  const res = await fetch("https://api.vapi.ai/assistant", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${cfg.vapiApiKey}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      name: "Homebase Receptionist",
+      firstMessage: `Hi! You've reached ${cfg.ownerName ?? "the family"}'s assistant. How can I help you?`,
+      model: {
+        provider: "anthropic",
+        model: "claude-haiku-4-5-20251001", // fast beats smart on a live line
+        messages: [{ role: "system", content: INBOUND_AGENT_PROMPT(cfg) }],
+        tools,
+      },
+      server: { url: `${cfg.publicUrl}/vapi/webhook`, secret: token },
+      maxDurationSeconds: 600,
+    }),
+  });
+  const assistant: any = await res.json();
+  if (!res.ok) return console.error(`Assistant create failed: ${JSON.stringify(assistant)}`);
+
+  const patch = await fetch(`https://api.vapi.ai/phone-number/${cfg.vapiPhoneNumberId}`, {
+    method: "PATCH",
+    headers: { Authorization: `Bearer ${cfg.vapiApiKey}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ assistantId: assistant.id }),
+  });
+  if (!patch.ok) return console.error(`Number assign failed: ${JSON.stringify(await patch.json())}`);
+  console.log(
+    `Inbound receptionist live (assistant ${assistant.id}). Calls to the Homebase number are now answered by the AI;\n` +
+      `the family gets a push summary after each call.${cfg.ownerCallback ? ` Urgent calls transfer to ${cfg.ownerCallback}.` : ""}`
+  );
+}
+
 const TOOLS: AgentTool[] = [
   listsTool, calendarTool, memoryTool, weatherTool, filesTool,
   gcalListTool, gcalAddTool, gmailTool, emailVipsTool, smsTool, phoneCallTool, checkCallTool,
@@ -2031,6 +2100,33 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
         return html("✅ Your email is connected to Homebase on this phone only. You can close this tab.");
       }
 
+      // Vapi's end-of-call reports for the inbound receptionist — authenticated
+      // by the x-vapi-secret header (set during --setup-inbound), not the bearer.
+      if (req.method === "POST" && url.pathname === "/vapi/webhook") {
+        if ((req.headers["x-vapi-secret"] ?? "") !== token) return send(401, { error: "bad secret" });
+        const body = JSON.parse((await readBody(req)) || "{}");
+        const msg = body.message ?? {};
+        if (msg.type === "end-of-call-report") {
+          const caller = msg.call?.customer?.number ?? "unknown number";
+          const summary = msg.analysis?.summary ?? msg.summary ?? "(no summary)";
+          const text = `From ${caller}:\n${String(summary).slice(0, 500)}`;
+          recordFeed("📞 Incoming call", text);
+          sendExpoPush("📞 Incoming call", text).catch(() => {});
+          const calls = load<CallLogEntry[]>("calls", []);
+          calls.push({
+            id: msg.call?.id ?? randomUUID(),
+            number: caller,
+            purpose: "inbound call",
+            placedAt: new Date().toISOString(),
+            status: "ended",
+            summary: String(summary).slice(0, 300),
+            endedAt: new Date().toISOString(),
+          });
+          save("calls", calls);
+        }
+        return send(200, { ok: true });
+      }
+
       if ((req.headers.authorization ?? "") !== `Bearer ${token}`) return send(401, { error: "unauthorized" });
 
       // Mint a personal-email connect URL for this phone (10-min single-use state).
@@ -2358,6 +2454,7 @@ async function main() {
   }
 
   if (args.includes("--google-auth")) return googleConnect();
+  if (args.includes("--setup-inbound")) return setupInboundAgent();
 
   const serve = args.includes("--serve");
   const cfg = await getConfig(!serve); // non-interactive in serve mode (no stdin on Railway)
