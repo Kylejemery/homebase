@@ -734,8 +734,12 @@ const gmailTool: AgentTool = {
       const from = h("From").replace(/<.*>/, "").trim();
       let line = `FROM ${from} — ${h("Subject")}`;
       if (input.detail) {
-        const body = gmailPlainText(msg.payload).replace(/\s+/g, " ").slice(0, 1500);
+        const plain = gmailPlainText(msg.payload);
+        const html = plain ? "" : gmailHtml(msg.payload);
+        const body = (plain || html.replace(/<[^>]+>/g, " ")).replace(/\s+/g, " ").slice(0, 1500);
+        const links = extractLinks(`${plain} ${html}`).slice(0, 6);
         line += `\n  ${body || msg.snippet || "(no text)"}`;
+        if (links.length) line += `\n  LINKS: ${links.join(" ")}`;
       } else if (msg.snippet) {
         line += ` — ${msg.snippet.slice(0, 140)}`;
       }
@@ -761,6 +765,89 @@ function gmailPlainText(payload: any): string {
   }
   return "";
 }
+
+// First text/html part (base64url) — many senders (schools) are HTML-only.
+function gmailHtml(payload: any): string {
+  if (!payload) return "";
+  if (payload.mimeType === "text/html" && payload.body?.data) {
+    try {
+      return Buffer.from(payload.body.data.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf-8");
+    } catch {
+      return "";
+    }
+  }
+  for (const part of payload.parts ?? []) {
+    const t = gmailHtml(part);
+    if (t) return t;
+  }
+  return "";
+}
+
+// Pull http(s) URLs from body text + href attributes; dedupe, drop tracking-pixel noise.
+function extractLinks(text: string): string[] {
+  const urls = new Set<string>();
+  for (const m of text.matchAll(/href=["']([^"']+)["']/gi)) urls.add(m[1]);
+  for (const m of text.matchAll(/https?:\/\/[^\s"'<>)]+/gi)) urls.add(m[0]);
+  return [...urls].filter((u) => /^https?:\/\//i.test(u) && !/\.(png|jpg|jpeg|gif|css|js)(\?|$)/i.test(u));
+}
+
+// Block obvious SSRF targets — this fetches URLs that arrive in emails.
+function isPrivateHost(host: string): boolean {
+  const h = host.toLowerCase();
+  return (
+    h === "localhost" || h.endsWith(".local") || h.endsWith(".internal") ||
+    /^127\./.test(h) || /^10\./.test(h) || /^192\.168\./.test(h) ||
+    /^172\.(1[6-9]|2\d|3[01])\./.test(h) || /^169\.254\./.test(h) || h === "0.0.0.0" || h === "::1"
+  );
+}
+
+const fetchWebTool: AgentTool = {
+  schema: {
+    name: "fetch_webpage",
+    description:
+      "Fetch a web page and return its readable text. Use this to follow a link from an email (e.g. a school " +
+      "newsletter or event page the email just links to) so you can pull out dates, times, and details. " +
+      "Follows redirects, including email tracking/redirect wrappers. After extracting dates, offer to add " +
+      "them to the calendar (confirm first — never add silently).",
+    input_schema: {
+      type: "object",
+      properties: { url: { type: "string", description: "The http(s) URL to open" } },
+      required: ["url"],
+    },
+  },
+  handler: async (input) => {
+    let u: URL;
+    try {
+      u = new URL(input.url);
+    } catch {
+      return "That doesn't look like a valid URL.";
+    }
+    if (!/^https?:$/.test(u.protocol)) return "Only http/https links can be opened.";
+    if (isPrivateHost(u.hostname)) return "That link points to a private/internal address — not fetching it.";
+    try {
+      const res = await fetch(u.toString(), {
+        headers: { "User-Agent": "Mozilla/5.0 (Homebase family agent)" },
+        redirect: "follow",
+        signal: AbortSignal.timeout(15000),
+      });
+      if (!res.ok) return `Couldn't open the page (HTTP ${res.status}).`;
+      const type = res.headers.get("content-type") ?? "";
+      if (!/text|html|xml|json/i.test(type)) return `That link is a ${type || "non-text"} file I can't read as text.`;
+      const html = await res.text();
+      const text = html
+        .replace(/<script[\s\S]*?<\/script>/gi, " ")
+        .replace(/<style[\s\S]*?<\/style>/gi, " ")
+        .replace(/<[^>]+>/g, " ")
+        .replace(/&nbsp;/g, " ")
+        .replace(/\s+/g, " ")
+        .trim()
+        .slice(0, 6000);
+      return text || "(the page had no readable text)";
+    } catch (err: any) {
+      return `Couldn't open the page: ${err.message}`;
+    }
+  },
+};
 
 // ── Email VIPs — senders that trigger an immediate alert ────────────────────
 // Per-phone lists (the person who says "the school is important" gets the
@@ -1247,7 +1334,7 @@ async function setupInboundAgent() {
 
 const TOOLS: AgentTool[] = [
   listsTool, calendarTool, memoryTool, weatherTool, filesTool,
-  gcalListTool, gcalAddTool, gmailTool, emailVipsTool, contactsTool, smsTool, phoneCallTool, checkCallTool,
+  gcalListTool, gcalAddTool, gmailTool, emailVipsTool, fetchWebTool, contactsTool, smsTool, phoneCallTool, checkCallTool,
   commitmentsTool,
 ];
 
@@ -1342,6 +1429,10 @@ store it with manage_commitments so the daily briefings can surface it. Never ac
 without asking first.
 EMAIL VIPs: when the user says a sender matters ("alert me when the school emails"), store it with
 manage_email_vips — they'll get a push alert within ~10 minutes of that sender's next email.
+EMAIL LINKS: many important emails (school newsletters, event invites) only LINK to the real content
+instead of including it. When gmail_summary shows LINKS and the actual dates/details aren't in the email
+body itself, use fetch_webpage on the relevant link to open it and read the real content, then extract the
+dates and offer to add them to the calendar (confirm before adding).
 CONFLICTS: when adding calendar events, watch for clashes — with existing events AND with known routines
 in family_memory habits — and mention them.
 TEXTS: you can send real SMS with send_sms. ALWAYS confirm the recipient and exact text with the user first.
