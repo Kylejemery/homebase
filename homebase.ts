@@ -2010,7 +2010,7 @@ async function runBriefingAndDeliver(client: Anthropic, kind: "morning" | "debri
   const title = kind === "debrief" ? "Afternoon debrief" : "Morning briefing";
   const history: Anthropic.MessageParam[] = [{ role: "user", content: task }];
   const result = await runAgentTurn(client, history, false);
-  recordFeed(title, result);
+  recordFeed(title, result, undefined, "briefing");
   const report: string[] = [];
   if (pushCount) report.push(await sendExpoPush(title, result));
   if (hasTelegram) {
@@ -2034,11 +2034,18 @@ interface FeedItem {
   body: string;
   sessionId?: string; // present = personal (one phone only); absent = household-wide
   dismissed?: boolean; // checked off on the Home page — hidden from alert surfaces
+  kind?: "briefing" | "nudge" | "call" | "vip" | "digest"; // routing: only alert-worthy kinds hit Home/fridge
 }
 
-function recordFeed(title: string, body: string, sessionId?: string) {
+// Kinds that belong on the shared "Family alerts" surfaces (Home page, fridge):
+// actionable household stuff — nudge findings (early events, conflicts, email
+// deadlines) and VIP-sender alerts. Calls live in the comms log; briefings are
+// routine and live in chat.
+const ALERT_KINDS = new Set(["nudge", "vip"]);
+
+function recordFeed(title: string, body: string, sessionId?: string, kind?: FeedItem["kind"]) {
   const feed = load<FeedItem[]>("feed", []);
-  feed.push({ at: new Date().toISOString(), title, body, ...(sessionId ? { sessionId } : {}) });
+  feed.push({ at: new Date().toISOString(), title, body, ...(sessionId ? { sessionId } : {}), ...(kind ? { kind } : {}) });
   save("feed", feed.slice(-80));
 }
 
@@ -2133,7 +2140,7 @@ async function deliverPersonalEmailDigests(client: Anthropic, kind: "morning" | 
       });
       const text = resp.content.filter((b): b is Anthropic.TextBlock => b.type === "text").map((b) => b.text).join("").trim();
       if (!text || /^NOTHING\b/i.test(text)) continue;
-      recordFeed("Your inbox", text, sessionId);
+      recordFeed("Your inbox", text, sessionId, "digest");
       await sendExpoPush("Your inbox", text, sessionId);
       delivered++;
     } catch {}
@@ -2174,7 +2181,7 @@ async function checkVipEmails(): Promise<void> {
         const h = (n: string) => msg.payload?.headers?.find((x: any) => x.name.toLowerCase() === n.toLowerCase())?.value ?? "";
         const from = h("From").replace(/<.*>/, "").trim();
         const body = `${from}: ${h("Subject")}${msg.snippet ? `\n${String(msg.snippet).slice(0, 160)}` : ""}`;
-        recordFeed("📬 Important email", body, sid === "household" ? undefined : sid);
+        recordFeed("📬 Important email", body, sid === "household" ? undefined : sid, "vip");
         await sendExpoPush("📬 Important email", body, sid === "household" ? undefined : sid);
       }
     } catch {}
@@ -2192,7 +2199,7 @@ async function runNudgeAndDeliver(client: Anthropic): Promise<string> {
   const history: Anthropic.MessageParam[] = [{ role: "user", content: NUDGE_TASK(cfg) }];
   const result = (await runAgentTurn(client, history, false)).trim();
   if (/^NOTHING\b/i.test(result)) return "Quiet night — nothing worth a nudge.";
-  recordFeed("Heads up for tomorrow", result);
+  recordFeed("Heads up for tomorrow", result, undefined, "nudge");
   const report: string[] = [];
   if (pushCount) report.push(await sendExpoPush("Heads up for tomorrow", result));
   if (hasTelegram) {
@@ -2646,7 +2653,7 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
           const caller = msg.call?.customer?.number ?? "unknown number";
           const summary = msg.analysis?.summary ?? msg.summary ?? "(no summary)";
           const text = `From ${caller}:\n${String(summary).slice(0, 500)}`;
-          recordFeed("📞 Incoming call", text);
+          recordFeed("📞 Incoming call", text, undefined, "call"); // chat feed + comms, not Family alerts
           sendExpoPush("📞 Incoming call", text).catch(() => {});
           const calls = load<CallLogEntry[]>("calls", []);
           calls.push({
@@ -2684,7 +2691,7 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
             events: await mergedCalendar(todayStart, 30),
             grocery: (lists["grocery"] ?? []).filter((i) => !i.done),
             weather: await displayWeather(),
-            alerts: feedFor(undefined).filter((f) => !f.dismissed).slice(-3).reverse(),
+            alerts: feedFor(undefined).filter((f) => !f.dismissed && ALERT_KINDS.has(f.kind ?? "")).slice(-3).reverse(),
           });
         }
 
@@ -2762,12 +2769,14 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
         saveSessions();
         // Call outcomes go out as push notifications and surface as a note on the
         // next turn — never appended to a live history (that corrupts mid-flight turns).
+        // Call outcomes are the caller's business: personal feed item + push to
+        // their phone only. The shared comms log still records every call.
         scheduleCallFollowups((t) => {
           const q = pendingNotes.get(sessionId) ?? [];
           q.push(t);
           pendingNotes.set(sessionId, q);
-          recordFeed("Call update", t);
-          sendExpoPush("Call update", t).catch(() => {});
+          recordFeed("Call update", t, sessionId, "call");
+          sendExpoPush("Call update", t, sessionId).catch(() => {});
         });
         return send(200, { reply });
       }
@@ -2930,7 +2939,7 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
           familyName: fam.name ?? null,
           members: fam.members,
           eventsToday,
-          alerts: feedFor(undefined).filter((f) => !f.dismissed).slice(-5).reverse(),
+          alerts: feedFor(undefined).filter((f) => !f.dismissed && ALERT_KINDS.has(f.kind ?? "")).slice(-5).reverse(),
           stats: { openGrocery, commitmentsDue },
         });
       }
