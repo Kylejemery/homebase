@@ -622,7 +622,10 @@ const gcalAddTool: AgentTool = {
     name: "google_calendar_add",
     description:
       "Add an event to the family's real Google Calendar (primary). Prefer this over manage_calendar for " +
-      "ADDING events when connected. Resolve relative dates to ISO datetimes first.",
+      "ADDING events when connected. Resolve relative dates to ISO datetimes first. Include 'attendees' " +
+      "(email addresses) to send real calendar INVITES — Google emails each person an Accept/Decline invite. " +
+      "ALWAYS confirm with the user before inviting anyone: who, their email, and the event details. " +
+      "Look up emails in manage_contacts first; ask for and save any that are missing.",
     input_schema: {
       type: "object",
       properties: {
@@ -632,6 +635,11 @@ const gcalAddTool: AgentTool = {
         all_day: { type: "boolean", description: "All-day event (start is then YYYY-MM-DD)" },
         location: { type: "string" },
         notes: { type: "string" },
+        attendees: {
+          type: "array",
+          items: { type: "string" },
+          description: "Email addresses to invite (user-confirmed) — they receive a Google Calendar invite",
+        },
       },
       required: ["title", "start"],
     },
@@ -640,6 +648,8 @@ const gcalAddTool: AgentTool = {
     const token = await googleAccessToken();
     if (!token) return GCAL_NOT_CONNECTED;
     const body: any = { summary: input.title, location: input.location, description: input.notes };
+    if (Array.isArray(input.attendees) && input.attendees.length)
+      body.attendees = input.attendees.map((email: string) => ({ email: String(email).trim() }));
     if (input.all_day) {
       const day = input.start.slice(0, 10);
       const next = new Date(new Date(`${day}T00:00:00`).getTime() + 86400000).toISOString().slice(0, 10);
@@ -650,7 +660,8 @@ const gcalAddTool: AgentTool = {
       body.start = { dateTime: new Date(startMs).toISOString() };
       body.end = { dateTime: new Date(input.end ? new Date(input.end).getTime() : startMs + 3600000).toISOString() };
     }
-    const res = await fetch("https://www.googleapis.com/calendar/v3/calendars/primary/events", {
+    // sendUpdates=all → Google emails real Accept/Decline invites to attendees
+    const res = await fetch("https://www.googleapis.com/calendar/v3/calendars/primary/events?sendUpdates=all", {
       method: "POST",
       headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
       body: JSON.stringify(body),
@@ -658,6 +669,8 @@ const gcalAddTool: AgentTool = {
     const data: any = await res.json();
     if (!res.ok) return `Google Calendar error: ${data.error?.message ?? res.status}`;
     let out = `Added to Google Calendar: ${gcalFmt(data)}${data.htmlLink ? `\n${data.htmlLink}` : ""}`;
+    if (body.attendees?.length)
+      out += `\nInvites emailed to: ${body.attendees.map((a: any) => a.email).join(", ")}`;
     // conflict watch: anything else that day within ±90 min of the new start
     if (!input.all_day) {
       const day = input.start.slice(0, 10);
@@ -985,7 +998,8 @@ const emailVipsTool: AgentTool = {
 
 interface Contact {
   name: string;
-  phone: string;
+  phone?: string;
+  email?: string;
   notes?: string;
 }
 
@@ -993,16 +1007,17 @@ const contactsTool: AgentTool = {
   schema: {
     name: "manage_contacts",
     description:
-      "The family's remembered contacts (name → phone number). Use 'find' to LOOK UP a number before " +
-      "calling or texting so the user never has to re-enter it ('text Aundrea' → find her contact → use the " +
-      "number with send_sms). Proactively 'add' a contact whenever a new name + number is used. " +
-      "Actions: 'add' (name, phone, optional notes/relation), 'find' (query), 'list', 'remove' (name). E.164 numbers.",
+      "The family's remembered contacts (name → phone and/or email). Use 'find' to LOOK UP details before " +
+      "calling, texting, or sending calendar invites, so the user never re-enters them ('invite Grandma' → " +
+      "find her email). Proactively 'add'/update a contact whenever a new name + number/email is used. " +
+      "Actions: 'add' (name + phone and/or email, merges with existing), 'find' (query), 'list', 'remove' (name).",
     input_schema: {
       type: "object",
       properties: {
         action: { type: "string", enum: ["add", "find", "list", "remove"] },
         name: { type: "string" },
         phone: { type: "string", description: "E.164, e.g. +19195551234" },
+        email: { type: "string", description: "Email address (used for calendar invites)" },
         notes: { type: "string", description: "Relation or context, e.g. 'wife', 'pediatrician'" },
         query: { type: "string", description: "Name or keyword to search (for 'find')" },
       },
@@ -1011,13 +1026,21 @@ const contactsTool: AgentTool = {
   },
   handler: async (input) => {
     const contacts = load<Record<string, Contact>>("contacts", {});
+    const fmt = (c: Contact) =>
+      `${c.name}: ${[c.phone, c.email].filter(Boolean).join(" · ") || "(no details)"}${c.notes ? ` (${c.notes})` : ""}`;
     switch (input.action) {
       case "add": {
-        if (!input.name || !input.phone) return "Need a name and phone number.";
+        if (!input.name || (!input.phone && !input.email)) return "Need a name plus a phone number or email.";
         const key = input.name.toLowerCase().trim();
-        contacts[key] = { name: input.name.trim(), phone: input.phone.trim(), notes: input.notes };
+        const prev = contacts[key];
+        contacts[key] = {
+          name: input.name.trim(),
+          phone: input.phone?.trim() ?? prev?.phone,
+          email: input.email?.trim() ?? prev?.email,
+          notes: input.notes ?? prev?.notes,
+        };
         save("contacts", contacts);
-        return `Saved contact: ${input.name} — ${input.phone}${input.notes ? ` (${input.notes})` : ""}`;
+        return `Saved contact: ${fmt(contacts[key])}`;
       }
       case "find": {
         const q = (input.query ?? input.name ?? "").toLowerCase().trim();
@@ -1025,12 +1048,12 @@ const contactsTool: AgentTool = {
           (c) => !q || c.name.toLowerCase().includes(q) || (c.notes ?? "").toLowerCase().includes(q)
         );
         return hits.length
-          ? hits.map((c) => `${c.name}: ${c.phone}${c.notes ? ` (${c.notes})` : ""}`).join("\n")
-          : `No contact matching "${q}". Ask the user for the number, then save it.`;
+          ? hits.map(fmt).join("\n")
+          : `No contact matching "${q}". Ask the user for the details, then save them.`;
       }
       case "list": {
         const all = Object.values(contacts);
-        return all.length ? all.map((c) => `${c.name}: ${c.phone}${c.notes ? ` (${c.notes})` : ""}`).join("\n") : "No saved contacts yet.";
+        return all.length ? all.map(fmt).join("\n") : "No saved contacts yet.";
       }
       case "remove": {
         const key = (input.name ?? "").toLowerCase().trim();
@@ -1587,6 +1610,9 @@ body itself, use fetch_webpage on the relevant link to open it and read the real
 dates and offer to add them to the calendar (confirm before adding).
 CONFLICTS: when adding calendar events, watch for clashes — with existing events AND with known routines
 in family_memory habits — and mention them.
+INVITES: google_calendar_add with attendees sends real calendar invites by email. Treat like texts/calls:
+show the user who's being invited (names + emails) and the event details, and only send after explicit
+approval. Pull emails from manage_contacts; ask for and save missing ones.
 TEXTS: you can send real SMS with send_sms. ALWAYS confirm the recipient and exact text with the user first.
 EMAIL SENDING: you can draft and send email from the asker's own Gmail (send_email). Show the FULL draft
 (to, subject, body) and send only after explicit approval. If they haven't connected their email (✉ in the
