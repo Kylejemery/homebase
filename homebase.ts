@@ -813,6 +813,86 @@ const emailVipsTool: AgentTool = {
 
 // ── SMS via Twilio — the agent texts family members or anyone else ──────────
 
+// ── Contacts — remembered people so numbers don't get re-entered ────────────
+
+interface Contact {
+  name: string;
+  phone: string;
+  notes?: string;
+}
+
+const contactsTool: AgentTool = {
+  schema: {
+    name: "manage_contacts",
+    description:
+      "The family's remembered contacts (name → phone number). Use 'find' to LOOK UP a number before " +
+      "calling or texting so the user never has to re-enter it ('text Aundrea' → find her contact → use the " +
+      "number with send_sms). Proactively 'add' a contact whenever a new name + number is used. " +
+      "Actions: 'add' (name, phone, optional notes/relation), 'find' (query), 'list', 'remove' (name). E.164 numbers.",
+    input_schema: {
+      type: "object",
+      properties: {
+        action: { type: "string", enum: ["add", "find", "list", "remove"] },
+        name: { type: "string" },
+        phone: { type: "string", description: "E.164, e.g. +19195551234" },
+        notes: { type: "string", description: "Relation or context, e.g. 'wife', 'pediatrician'" },
+        query: { type: "string", description: "Name or keyword to search (for 'find')" },
+      },
+      required: ["action"],
+    },
+  },
+  handler: async (input) => {
+    const contacts = load<Record<string, Contact>>("contacts", {});
+    switch (input.action) {
+      case "add": {
+        if (!input.name || !input.phone) return "Need a name and phone number.";
+        const key = input.name.toLowerCase().trim();
+        contacts[key] = { name: input.name.trim(), phone: input.phone.trim(), notes: input.notes };
+        save("contacts", contacts);
+        return `Saved contact: ${input.name} — ${input.phone}${input.notes ? ` (${input.notes})` : ""}`;
+      }
+      case "find": {
+        const q = (input.query ?? input.name ?? "").toLowerCase().trim();
+        const hits = Object.values(contacts).filter(
+          (c) => !q || c.name.toLowerCase().includes(q) || (c.notes ?? "").toLowerCase().includes(q)
+        );
+        return hits.length
+          ? hits.map((c) => `${c.name}: ${c.phone}${c.notes ? ` (${c.notes})` : ""}`).join("\n")
+          : `No contact matching "${q}". Ask the user for the number, then save it.`;
+      }
+      case "list": {
+        const all = Object.values(contacts);
+        return all.length ? all.map((c) => `${c.name}: ${c.phone}${c.notes ? ` (${c.notes})` : ""}`).join("\n") : "No saved contacts yet.";
+      }
+      case "remove": {
+        const key = (input.name ?? "").toLowerCase().trim();
+        if (!contacts[key]) return `No contact named "${input.name}".`;
+        delete contacts[key];
+        save("contacts", contacts);
+        return `Removed ${input.name}.`;
+      }
+      default:
+        return "Unknown action.";
+    }
+  },
+};
+
+// ── Communication log — unified record of calls + texts, in and out ─────────
+
+interface CommEntry {
+  at: string;
+  type: "call" | "sms";
+  direction: "in" | "out";
+  party: string; // the other number
+  summary: string;
+}
+
+function logComm(entry: CommEntry) {
+  const log = load<CommEntry[]>("comms", []);
+  log.push(entry);
+  save("comms", log.slice(-300));
+}
+
 const smsTool: AgentTool = {
   schema: {
     name: "send_sms",
@@ -846,6 +926,7 @@ const smsTool: AgentTool = {
     );
     const data: any = await res.json();
     if (!res.ok) return `SMS failed: ${data.message ?? JSON.stringify(data)}`;
+    logComm({ at: new Date().toISOString(), type: "sms", direction: "out", party: input.to, summary: input.body.slice(0, 200) });
     return `Text sent to ${input.to} (sid ${data.sid}, status ${data.status}).`;
   },
 };
@@ -942,6 +1023,7 @@ const phoneCallTool: AgentTool = {
       status: "in-progress",
     });
     save("calls", calls);
+    logComm({ at: new Date().toISOString(), type: "call", direction: "out", party: input.phone_number, summary: input.briefing.slice(0, 200) });
     PENDING_FOLLOWUPS.push(data.id);
     return `Call placed (id: ${data.id}). Dialing ${input.phone_number} now. I'll follow up with the outcome automatically, or use check_phone_call to check sooner.`;
   },
@@ -1165,7 +1247,7 @@ async function setupInboundAgent() {
 
 const TOOLS: AgentTool[] = [
   listsTool, calendarTool, memoryTool, weatherTool, filesTool,
-  gcalListTool, gcalAddTool, gmailTool, emailVipsTool, smsTool, phoneCallTool, checkCallTool,
+  gcalListTool, gcalAddTool, gmailTool, emailVipsTool, contactsTool, smsTool, phoneCallTool, checkCallTool,
   commitmentsTool,
 ];
 
@@ -1228,6 +1310,10 @@ WHAT THE FAMILY CAN DO (answer "what can you do" questions from this, and guide 
 - 📄 Scan button in the app header: photograph a document (school calendar, insurance card, wifi label)
   and its facts land in family_memory — retrievable by asking you.
 - Checked-off groceries teach the restock learner; staples bought on a steady rhythm get auto-added.
+- You remember contacts (manage_contacts) — look up a saved number before calling/texting instead of
+  asking again, and save new people automatically. When someone says "text/call <name>", find the contact first.
+- There's a communication log of every call and text. When the user asks to see their calls/texts/history,
+  render a button to open it with this EXACT syntax: {{open:comms|View communication log}} (the app makes it tappable).
 DAILY RHYTHM (${tz}): restock check 05:30 → morning briefing ${cfg.briefingTime ?? "07:00"} (calendar,
 weather, important emails, commitments, restocked staples) → afternoon debrief ${cfg.debriefTime ?? "16:30"}
 (today's recap + tomorrow) → evening nudge ${cfg.nudgeTime ?? "20:00"} (only when something warrants it:
@@ -1235,15 +1321,16 @@ early events, conflicts, emails with dates not on the calendar) → habit reflec
 (silent). All delivered as push notifications and shown in the app's chat feed.
 
 CALL SCREENING: The household's AI phone line is ${cfg.twilioFromNumber ?? "(not set — tell them to set TWILIO_FROM_NUMBER on the server first)"}.
-If it isn't set, say so and stop. Otherwise, when asked how to forward/screen calls to it, give the right
-carrier codes and render EACH as a tappable dial button with this EXACT syntax (the app makes it a button):
-{{dial:Label|code}} — substitute the household line's number (digits only, no +) for <NUMBER>.
-Standard GSM (AT&T / T-Mobile):
-  unanswered {{dial:Forward missed calls|*61*<NUMBER>#}}, busy {{dial:Forward when busy|*67*<NUMBER>#}},
-  unreachable {{dial:Forward when off|*62*<NUMBER>#}}, cancel all {{dial:Turn off forwarding|##002#}}.
-Verizon: no-answer {{dial:Forward missed calls|*71<NUMBER>}}, cancel {{dial:Turn off forwarding|*73}}.
-Ask their carrier if unknown (AT&T/T-Mobile = first set, Verizon = second). Recommend "unanswered only" so
-they still get calls normally and only missed ones reach the assistant.
+If it isn't set, say so and stop. Otherwise: you MUST first know the person's carrier, because the codes
+differ — if you don't know it, ASK ("Are you on AT&T/T-Mobile, or Verizon?") and wait. Then render ONLY that
+one carrier's buttons — NEVER show both sets (duplicate buttons are confusing). Button syntax (the app turns
+it into a tappable button): {{dial:Label|code}} — put the household line's number (digits only, no +) where
+<NUMBER> is.
+- AT&T / T-Mobile (and most GSM) — four options:
+  {{dial:Forward missed calls|*61*<NUMBER>#}} {{dial:Forward when busy|*67*<NUMBER>#}}
+  {{dial:Forward when phone is off|*62*<NUMBER>#}} {{dial:Turn off all forwarding|##002#}}
+- Verizon — two options: {{dial:Forward missed calls|*71<NUMBER>}} {{dial:Turn off forwarding|*73}}
+Recommend "Forward missed calls" so they still get calls normally and only unanswered ones reach the assistant.
 Resolve relative dates ("Saturday", "tomorrow") to ISO datetimes yourself before calling calendar tools.
 Proactively store useful facts in family_memory when people mention them.
 Be concise and practical — you're texting busy parents, not writing essays.
@@ -2133,6 +2220,7 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
             endedAt: new Date().toISOString(),
           });
           save("calls", calls);
+          logComm({ at: new Date().toISOString(), type: "call", direction: "in", party: caller, summary: String(summary).slice(0, 200) });
         }
         return send(200, { ok: true });
       }
@@ -2240,6 +2328,11 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
       if (req.method === "GET" && url.pathname === "/feed") {
         const sid = url.searchParams.get("sessionId") ?? undefined;
         return send(200, { items: feedFor(sid).slice(-20) });
+      }
+
+      // Communication log — calls + texts, in and out, newest first (comms screen).
+      if (req.method === "GET" && url.pathname === "/communications") {
+        return send(200, { items: load<CommEntry[]>("comms", []).slice(-100).reverse() });
       }
 
       // ── Structured data for the app's Grocery + Calendar screens ──────────
