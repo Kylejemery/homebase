@@ -111,6 +111,7 @@ interface Config {
   haikuRouting?: boolean; // false disables fast-model routing of trivial turns
   mcpServers?: { name: string; command: string; args?: string[] }[];
   serverToken?: string; // shared secret the mobile app sends to the --serve brain
+  displayToken?: string; // read-mostly key for the fridge/wall display page
   briefingTime?: string; // "HH:MM" — when --serve sends the daily briefing (default 07:00)
   briefingTimezone?: string; // IANA tz for briefingTime (default America/New_York)
   debriefTime?: string; // "HH:MM" — afternoon debrief (default 16:30)
@@ -2415,6 +2416,117 @@ function sanitizeHistory(history: Anthropic.MessageParam[]) {
   }
 }
 
+// Weather for the display, cached 15 min so a 60s-refresh tablet doesn't hammer APIs.
+let WEATHER_CACHE: { at: number; data: any } | null = null;
+async function displayWeather(): Promise<any | null> {
+  const cfg = load<Config>("config", {});
+  if (!cfg.homeCity) return null;
+  if (WEATHER_CACHE && Date.now() - WEATHER_CACHE.at < 15 * 60 * 1000) return WEATHER_CACHE.data;
+  try {
+    const geo: any = await (
+      await fetch(`https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(cfg.homeCity)}&count=1`)
+    ).json();
+    const place = geo.results?.[0];
+    if (!place) return null;
+    const wx: any = await (
+      await fetch(
+        `https://api.open-meteo.com/v1/forecast?latitude=${place.latitude}&longitude=${place.longitude}` +
+          `&current=temperature_2m,weather_code&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max` +
+          `&temperature_unit=fahrenheit&timezone=auto&forecast_days=1`
+      )
+    ).json();
+    const data = {
+      city: place.name,
+      now: Math.round(wx.current?.temperature_2m),
+      hi: Math.round(wx.daily?.temperature_2m_max?.[0]),
+      lo: Math.round(wx.daily?.temperature_2m_min?.[0]),
+      rain: wx.daily?.precipitation_probability_max?.[0] ?? 0,
+    };
+    WEATHER_CACHE = { at: Date.now(), data };
+    return data;
+  } catch {
+    return null;
+  }
+}
+
+// The fridge/wall page: one static HTML file, renders from /display/data, made
+// to be read across a kitchen — big type, dark, auto-refreshing, zero chrome.
+const DISPLAY_PAGE = `<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Homebase</title><style>
+:root{--bg:#12141c;--card:#1c1f2b;--card2:#242838;--accent:#6c7dff;--text:#eef0f6;--dim:#9aa0b4;--ok:#5dd39e;--border:#2c3040}
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:var(--bg);color:var(--text);font-family:-apple-system,'Segoe UI',Roboto,sans-serif;height:100vh;overflow:hidden;padding:2.2vmin;display:flex;flex-direction:column;gap:1.6vmin}
+header{display:flex;justify-content:space-between;align-items:baseline}
+#fam{font-size:4.6vmin;font-weight:800}
+#date{color:var(--dim);font-size:2.4vmin;margin-top:.4vmin}
+#right{text-align:right}
+#clock{font-size:5.6vmin;font-weight:800;font-variant-numeric:tabular-nums}
+#wx{color:var(--dim);font-size:2.2vmin}
+main{flex:1;display:grid;grid-template-columns:2fr 1fr;gap:1.6vmin;min-height:0}
+.col{display:flex;flex-direction:column;gap:1.6vmin;min-height:0}
+.card{background:var(--card);border:1px solid var(--border);border-radius:1.6vmin;padding:1.8vmin;overflow:hidden}
+.card h2{font-size:1.9vmin;color:var(--accent);text-transform:uppercase;letter-spacing:.14em;margin-bottom:1.2vmin}
+#agenda{flex:1;overflow:hidden}
+.day{margin-bottom:1.6vmin}
+.dayname{font-size:2vmin;font-weight:800;color:var(--dim);margin-bottom:.6vmin}
+.dayname.today{color:var(--ok)}
+.ev{display:flex;gap:1.2vmin;align-items:baseline;padding:.5vmin 0;font-size:2.5vmin}
+.ev .t{color:var(--accent);font-weight:700;min-width:11vmin;font-size:2.1vmin}
+.ev .dot{width:1.1vmin;height:1.1vmin;border-radius:50%;flex:none;align-self:center}
+.ev .who{color:var(--dim);font-size:2vmin}
+.none{color:var(--dim);font-size:2.2vmin}
+#grocery{flex:1.4;overflow:hidden}
+.g{display:flex;align-items:center;gap:1.2vmin;padding:.7vmin 0;font-size:2.4vmin;cursor:pointer}
+.g .box{width:2.6vmin;height:2.6vmin;border:.3vmin solid var(--dim);border-radius:.7vmin;flex:none}
+.chips{display:flex;flex-wrap:wrap;gap:1vmin}
+.chip{background:var(--card2);border:1px solid var(--border);border-radius:2vmin;padding:.8vmin 1.5vmin;font-size:2vmin}
+.chip b{color:var(--accent)}
+.alert{padding:.8vmin 0;border-bottom:1px solid var(--border);font-size:2vmin;color:var(--dim)}
+.alert b{color:var(--text);display:block;font-size:2.1vmin}
+.alert:last-child{border-bottom:0}
+</style></head><body>
+<header><div><div id="fam">Homebase</div><div id="date"></div></div>
+<div id="right"><div id="clock"></div><div id="wx"></div></div></header>
+<main>
+<div class="col"><div class="card" id="agenda"><h2>This week</h2><div id="days"></div></div>
+<div class="card"><h2>Coming up</h2><div class="chips" id="countdowns"></div></div></div>
+<div class="col"><div class="card" id="grocery"><h2>🛒 Grocery</h2><div id="glist"></div></div>
+<div class="card"><h2>🔔 Alerts</h2><div id="alerts"></div></div></div>
+</main>
+<script>
+const KEY=new URLSearchParams(location.search).get("key");
+const esc=s=>String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+function tick(){const d=new Date();document.getElementById("clock").textContent=d.toLocaleTimeString("en-US",{hour:"numeric",minute:"2-digit"});document.getElementById("date").textContent=d.toLocaleDateString("en-US",{weekday:"long",month:"long",day:"numeric"})}
+setInterval(tick,1000);tick();
+function memberColor(ev,members){if(ev.who)for(const m of members)if(ev.who.toLowerCase().includes(m.name.toLowerCase()))return m.color;
+for(const m of members)if(ev.title.toLowerCase().includes(m.name.toLowerCase()))return m.color;
+return ev.source==="google"?"#6c7dff":"#5dd39e"}
+function timeLabel(ev){if(!ev.start.includes("T"))return "All day";return new Date(ev.start).toLocaleTimeString("en-US",{hour:"numeric",minute:"2-digit"})}
+async function toggle(id){await fetch("/display/toggle?key="+KEY,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id})});refresh()}
+async function refresh(){try{
+const r=await fetch("/display/data?key="+KEY);if(!r.ok)return;const d=await r.json();
+document.getElementById("fam").textContent=d.familyName;
+document.getElementById("wx").textContent=d.weather?\`\${d.weather.city} \${d.weather.now}° · H \${d.weather.hi}° L \${d.weather.lo}°\${d.weather.rain>30?" · ☔ "+d.weather.rain+"%":""}\`:"";
+const byDay={};for(const e of d.events){const k=e.start.slice(0,10);(byDay[k]??=[]).push(e)}
+const days=[];const now=new Date();
+for(let i=0;i<7;i++){const dt=new Date(now.getFullYear(),now.getMonth(),now.getDate()+i);
+const k=\`\${dt.getFullYear()}-\${String(dt.getMonth()+1).padStart(2,"0")}-\${String(dt.getDate()).padStart(2,"0")}\`;
+const evs=byDay[k]??[];if(i>1&&!evs.length)continue;
+const label=i===0?"Today":i===1?"Tomorrow":dt.toLocaleDateString("en-US",{weekday:"long",month:"short",day:"numeric"});
+days.push(\`<div class="day"><div class="dayname\${i===0?" today":""}">\${label}</div>\${
+evs.length?evs.map(e=>\`<div class="ev"><span class="dot" style="background:\${memberColor(e,d.members)}"></span><span class="t">\${timeLabel(e)}</span><span>\${esc(e.title)}</span>\${e.who?\`<span class="who">· \${esc(e.who)}</span>\`:""}</div>\`).join(""):'<div class="none">Nothing scheduled</div>'}</div>\`)}
+document.getElementById("days").innerHTML=days.join("");
+document.getElementById("glist").innerHTML=d.grocery.length?d.grocery.slice(0,12).map(g=>\`<div class="g" onclick="toggle(\${g.id})"><span class="box"></span>\${esc(g.item)}</div>\`).join("")+(d.grocery.length>12?\`<div class="none">+\${d.grocery.length-12} more</div>\`:""):'<div class="none">List is empty 🎉</div>';
+const cds=[];const seen=new Set();
+for(const e of d.events){const dd=Math.round((new Date(e.start.slice(0,10)+"T12:00")-new Date(now.getFullYear(),now.getMonth(),now.getDate(),12))/86400000);
+if(dd>=2&&dd<=30&&!seen.has(e.title)){seen.add(e.title);cds.push(\`<span class="chip"><b>\${dd} days</b> · \${esc(e.title)}</span>\`);if(cds.length>=4)break}}
+document.getElementById("countdowns").innerHTML=cds.join("")||'<span class="none">Nothing on the horizon</span>';
+document.getElementById("alerts").innerHTML=d.alerts.length?d.alerts.map(a=>\`<div class="alert"><b>\${esc(a.title)}</b>\${esc(a.body.slice(0,110))}</div>\`).join(""):'<div class="none">All quiet</div>';
+}catch(e){}}
+setInterval(refresh,60000);refresh();
+</script></body></html>`;
+
 async function serveMode(client: Anthropic, cfg: Config, port: number) {
   hydrateConfigFromEnv(cfg);
   let token = process.env.HOMEBASE_SERVER_TOKEN || cfg.serverToken;
@@ -2423,6 +2535,13 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
     cfg.serverToken = token;
     save("config", cfg);
   }
+  // Separate, weaker key for the fridge/wall display: read + grocery check-off
+  // only, so a tablet on the fridge never holds the full server token.
+  if (!cfg.displayToken) {
+    cfg.displayToken = randomUUID();
+    save("config", cfg);
+  }
+  const displayKey = cfg.displayToken;
 
   const sessions = new Map<string, Anthropic.MessageParam[]>(
     Object.entries(load<StoredSessions>("sessions", {}))
@@ -2504,6 +2623,45 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
           logComm({ at: new Date().toISOString(), type: "call", direction: "in", party: caller, summary: String(summary).slice(0, 200) });
         }
         return send(200, { ok: true });
+      }
+
+      // ── Fridge / wall display (own weak key; tablet browsers, kiosk mode) ──
+      if (url.pathname === "/display" || url.pathname.startsWith("/display/")) {
+        if (url.searchParams.get("key") !== displayKey) return send(401, { error: "bad display key" });
+
+        if (req.method === "GET" && url.pathname === "/display") {
+          res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+          return res.end(DISPLAY_PAGE);
+        }
+
+        if (req.method === "GET" && url.pathname === "/display/data") {
+          const todayStart = new Date();
+          todayStart.setHours(0, 0, 0, 0);
+          const fam = load<Family>("family", { members: [] });
+          const lists = load<Lists>("lists", {});
+          return send(200, {
+            familyName: fam.name ?? "Homebase",
+            members: fam.members,
+            events: await mergedCalendar(todayStart, 30),
+            grocery: (lists["grocery"] ?? []).filter((i) => !i.done),
+            weather: await displayWeather(),
+            alerts: feedFor(undefined).slice(-3).reverse(),
+          });
+        }
+
+        // The one write the display key allows: checking off a grocery item.
+        if (req.method === "POST" && url.pathname === "/display/toggle") {
+          const { id } = JSON.parse((await readBody(req)) || "{}");
+          const lists = load<Lists>("lists", {});
+          const it = (lists["grocery"] ?? []).find((i) => i.id === Number(id));
+          if (!it) return send(404, { error: "no such item" });
+          it.done = !it.done;
+          save("lists", lists);
+          if (it.done) logCheckoff(it.item);
+          return send(200, { ok: true });
+        }
+
+        return send(404, { error: "not found" });
       }
 
       if ((req.headers.authorization ?? "") !== `Bearer ${token}`) return send(401, { error: "unauthorized" });
@@ -2595,12 +2753,14 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
 
       // Ops visibility: where is data actually going, and is anything in it?
       if (req.method === "GET" && url.pathname === "/status") {
+        const cfgNow = load<Config>("config", {});
         return send(200, {
           dataDir: DIR,
           homebaseDirEnv: process.env.HOMEBASE_DIR ?? null,
           pushTokens: Object.keys(load<Record<string, string>>("push", {})).length,
           sessions: Object.keys(load<StoredSessions>("sessions", {})).length,
           listItems: Object.values(load<Lists>("lists", {})).reduce((n, l) => n + l.length, 0),
+          displayUrl: cfgNow.publicUrl && cfgNow.displayToken ? `${cfgNow.publicUrl}/display?key=${cfgNow.displayToken}` : null,
         });
       }
 
