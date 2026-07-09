@@ -1830,6 +1830,17 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
         return send(200, { lists });
       }
 
+      if (req.method === "POST" && url.pathname === "/lists/clear_done") {
+        const { list = "grocery" } = JSON.parse((await readBody(req)) || "{}");
+        const lists = load<Lists>("lists", {});
+        const name = String(list).toLowerCase();
+        if (lists[name]) {
+          lists[name] = lists[name].filter((i) => !i.done);
+          save("lists", lists);
+        }
+        return send(200, { lists });
+      }
+
       if (req.method === "POST" && url.pathname === "/lists/remove") {
         const { list, id } = JSON.parse((await readBody(req)) || "{}");
         const lists = load<Lists>("lists", {});
@@ -1845,10 +1856,10 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
         const days = Math.min(60, Number(url.searchParams.get("days")) || 14);
         const now = new Date();
         const horizon = new Date(now.getTime() + days * 86400000);
-        type Ev = { title: string; start: string; end?: string; who?: string; notes?: string; source: string };
+        type Ev = { id: string; title: string; start: string; end?: string; who?: string; notes?: string; source: string };
         const events: Ev[] = load<CalEvent[]>("calendar", [])
           .filter((e) => new Date(e.start) >= new Date(now.getTime() - 86400000) && new Date(e.start) <= horizon)
-          .map((e) => ({ title: e.title, start: e.start, end: e.end, who: e.who, notes: e.notes, source: "local" }));
+          .map((e) => ({ id: String(e.id), title: e.title, start: e.start, end: e.end, who: e.who, notes: e.notes, source: "local" }));
         const gtoken = await googleAccessToken();
         if (gtoken) {
           const g: any = await (
@@ -1863,6 +1874,7 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
           ).json();
           for (const e of g.items ?? []) {
             events.push({
+              id: String(e.id),
               title: e.summary ?? "(untitled)",
               start: e.start?.dateTime ?? e.start?.date ?? "",
               end: e.end?.dateTime ?? e.end?.date,
@@ -1873,6 +1885,68 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
         }
         events.sort((a, b) => a.start.localeCompare(b.start));
         return send(200, { events });
+      }
+
+      // Edit an event on either calendar. Google edits sync to the real calendar.
+      if (req.method === "POST" && url.pathname === "/calendar/update") {
+        const { source, id, title, start, end, notes, who } = JSON.parse((await readBody(req)) || "{}");
+        if (!id || !source) return send(400, { error: "source and id required" });
+        if (source === "local") {
+          const events = load<CalEvent[]>("calendar", []);
+          const ev = events.find((e) => e.id === Number(id));
+          if (!ev) return send(404, { error: `no local event ${id}` });
+          if (title) ev.title = title;
+          if (start) ev.start = start;
+          if (end !== undefined) ev.end = end || undefined;
+          if (notes !== undefined) ev.notes = notes || undefined;
+          if (who !== undefined) ev.who = who || undefined;
+          events.sort((a, b) => a.start.localeCompare(b.start));
+          save("calendar", events);
+          return send(200, { ok: true });
+        }
+        const token = await googleAccessToken();
+        if (!token) return send(400, { error: "Google Calendar not connected" });
+        const patch: any = {};
+        if (title) patch.summary = title;
+        if (notes !== undefined) patch.location = notes;
+        if (start) {
+          patch.start = { dateTime: new Date(start).toISOString() };
+          const endMs = end ? new Date(end).getTime() : new Date(start).getTime() + 3600000;
+          patch.end = { dateTime: new Date(endMs).toISOString() };
+        }
+        const res = await fetch(
+          `https://www.googleapis.com/calendar/v3/calendars/primary/events/${encodeURIComponent(id)}`,
+          {
+            method: "PATCH",
+            headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+            body: JSON.stringify(patch),
+          }
+        );
+        const data: any = await res.json().catch(() => ({}));
+        if (!res.ok) return send(res.status, { error: data.error?.message ?? "google update failed" });
+        return send(200, { ok: true });
+      }
+
+      if (req.method === "POST" && url.pathname === "/calendar/delete") {
+        const { source, id } = JSON.parse((await readBody(req)) || "{}");
+        if (!id || !source) return send(400, { error: "source and id required" });
+        if (source === "local") {
+          const events = load<CalEvent[]>("calendar", []);
+          const idx = events.findIndex((e) => e.id === Number(id));
+          if (idx === -1) return send(404, { error: `no local event ${id}` });
+          events.splice(idx, 1);
+          save("calendar", events);
+          return send(200, { ok: true });
+        }
+        const token = await googleAccessToken();
+        if (!token) return send(400, { error: "Google Calendar not connected" });
+        const res = await fetch(
+          `https://www.googleapis.com/calendar/v3/calendars/primary/events/${encodeURIComponent(id)}`,
+          { method: "DELETE", headers: { Authorization: `Bearer ${token}` } }
+        );
+        if (!res.ok && res.status !== 204 && res.status !== 410)
+          return send(res.status, { error: "google delete failed" });
+        return send(200, { ok: true });
       }
 
       // Recipe import: { url } or { image (base64), mediaType } → grocery list.
