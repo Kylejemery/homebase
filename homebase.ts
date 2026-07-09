@@ -1474,6 +1474,7 @@ async function runBriefingAndDeliver(client: Anthropic, kind: "morning" | "debri
   const title = kind === "debrief" ? "Afternoon debrief" : "Morning briefing";
   const history: Anthropic.MessageParam[] = [{ role: "user", content: task }];
   const result = await runAgentTurn(client, history, false);
+  recordFeed(title, result);
   const report: string[] = [];
   if (pushCount) report.push(await sendExpoPush(title, result));
   if (hasTelegram) {
@@ -1487,6 +1488,20 @@ async function runBriefingAndDeliver(client: Anthropic, kind: "morning" | "debri
   return report.join(" ");
 }
 
+// Every outbound notification is also recorded here so (a) the app can show it
+// in the chat feed and (b) the agent gets it as context on the next turn.
+interface FeedItem {
+  at: string;
+  title: string;
+  body: string;
+}
+
+function recordFeed(title: string, body: string) {
+  const feed = load<FeedItem[]>("feed", []);
+  feed.push({ at: new Date().toISOString(), title, body });
+  save("feed", feed.slice(-50));
+}
+
 // Evening nudge: runs the look-ahead scan; delivers only when the agent found
 // something (the NOTHING sentinel suppresses delivery entirely — no noise).
 async function runNudgeAndDeliver(client: Anthropic): Promise<string> {
@@ -1497,6 +1512,7 @@ async function runNudgeAndDeliver(client: Anthropic): Promise<string> {
   const history: Anthropic.MessageParam[] = [{ role: "user", content: NUDGE_TASK(cfg) }];
   const result = (await runAgentTurn(client, history, false)).trim();
   if (/^NOTHING\b/i.test(result)) return "Quiet night — nothing worth a nudge.";
+  recordFeed("Heads up for tomorrow", result);
   const report: string[] = [];
   if (pushCount) report.push(await sendExpoPush("Heads up for tomorrow", result));
   if (hasTelegram) {
@@ -1756,11 +1772,25 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
         const history = sessions.get(sessionId) ?? [];
         sessions.set(sessionId, history);
         sanitizeHistory(history); // repair sessions bricked by older followup injection
+        const prefixes: string[] = [];
         const notes = pendingNotes.get(sessionId);
         pendingNotes.delete(sessionId);
+        if (notes?.length) prefixes.push(`[system note — completed call outcome: ${notes.join(" | ")}]`);
+        // Give the agent the notifications this session hasn't discussed yet, so
+        // "yes, add that one" after a nudge/briefing has something to refer to.
+        const feed = load<FeedItem[]>("feed", []);
+        const reads = load<Record<string, string>>("feed-read", {});
+        const unread = feed.filter((f) => f.at > (reads[sessionId] ?? "")).slice(-3);
+        if (unread.length) {
+          prefixes.push(
+            `[system note — notifications recently sent to the family: ${unread.map((f) => `${f.title}: ${f.body.slice(0, 400)}`).join(" ||| ")}]`
+          );
+          reads[sessionId] = feed.at(-1)!.at;
+          save("feed-read", reads);
+        }
         history.push({
           role: "user",
-          content: notes?.length ? `[system note — completed call outcome: ${notes.join(" | ")}]\n${message}` : message,
+          content: prefixes.length ? `${prefixes.join("\n")}\n${message}` : message,
         });
         const reply = await runAgentTurn(client, history, false);
         trimHistory(history);
@@ -1771,6 +1801,7 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
           const q = pendingNotes.get(sessionId) ?? [];
           q.push(t);
           pendingNotes.set(sessionId, q);
+          recordFeed("Call update", t);
           sendExpoPush("Call update", t).catch(() => {});
         });
         return send(200, { reply });
@@ -1803,6 +1834,11 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
           sessions: Object.keys(load<StoredSessions>("sessions", {})).length,
           listItems: Object.values(load<Lists>("lists", {})).reduce((n, l) => n + l.length, 0),
         });
+      }
+
+      // Notification history — the app shows these inline in the chat feed.
+      if (req.method === "GET" && url.pathname === "/feed") {
+        return send(200, { items: load<FeedItem[]>("feed", []).slice(-20) });
       }
 
       // ── Structured data for the app's Grocery + Calendar screens ──────────
