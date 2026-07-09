@@ -612,7 +612,8 @@ const gcalListTool: AgentTool = {
     );
     const data: any = await res.json();
     if (!res.ok) return `Google Calendar error: ${data.error?.message ?? res.status}`;
-    const items = data.items ?? [];
+    // private events never surface through the agent (briefings go to the whole family)
+    const items = (data.items ?? []).filter((e: any) => e.visibility !== "private" && e.visibility !== "confidential");
     return items.length ? items.map(gcalFmt).join("\n") : "Nothing on the Google calendar for that window.";
   },
 };
@@ -640,6 +641,12 @@ const gcalAddTool: AgentTool = {
           items: { type: "string" },
           description: "Email addresses to invite (user-confirmed) — they receive a Google Calendar invite",
         },
+        private: {
+          type: "boolean",
+          description:
+            "true = personal event kept OFF all family surfaces (family calendar, Home, fridge, briefings). " +
+            "Use when the user says to keep it private/off the family calendar. It stays on their Google Calendar.",
+        },
       },
       required: ["title", "start"],
     },
@@ -648,6 +655,7 @@ const gcalAddTool: AgentTool = {
     const token = await googleAccessToken();
     if (!token) return GCAL_NOT_CONNECTED;
     const body: any = { summary: input.title, location: input.location, description: input.notes };
+    if (input.private) body.visibility = "private";
     if (Array.isArray(input.attendees) && input.attendees.length)
       body.attendees = input.attendees.map((email: string) => ({ email: String(email).trim() }));
     if (input.all_day) {
@@ -1610,6 +1618,10 @@ body itself, use fetch_webpage on the relevant link to open it and read the real
 dates and offer to add them to the calendar (confirm before adding).
 CONFLICTS: when adding calendar events, watch for clashes — with existing events AND with known routines
 in family_memory habits — and mention them.
+PRIVATE EVENTS: when someone asks to keep an event off the family calendar ("just for me",
+"private", "the family doesn't need to see this"), add it with private:true — it stays on their
+Google Calendar but never appears on family surfaces, briefings, or the fridge. Offer this when
+an event sounds personal (their own appointments, gifts, surprises).
 INVITES: google_calendar_add with attendees sends real calendar invites by email. Treat like texts/calls:
 show the user who's being invited (names + emails) and the event details, and only send after explicit
 approval. Pull emails from manage_contacts; ask for and save missing ones.
@@ -2102,6 +2114,8 @@ async function mergedCalendar(start: Date, days: number): Promise<MergedEvent[]>
       )
     ).json();
     for (const e of g.items ?? []) {
+      // Events marked private in Google stay off every family surface.
+      if (e.visibility === "private" || e.visibility === "confidential") continue;
       events.push({
         id: String(e.id),
         title: e.summary ?? "(untitled)",
@@ -2917,11 +2931,12 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
 
       // Add an event from the app's calendar form (Google when connected, else local).
       if (req.method === "POST" && url.pathname === "/calendar/add") {
-        const { title, start, end, who, notes, allDay } = JSON.parse((await readBody(req)) || "{}");
+        const { title, start, end, who, notes, allDay, private: priv } = JSON.parse((await readBody(req)) || "{}");
         if (!title || !start) return send(400, { error: "title and start required" });
         const gtoken = await googleAccessToken();
         if (gtoken) {
           const body: any = { summary: title, location: notes };
+          if (priv) body.visibility = "private";
           if (allDay) {
             const day = String(start).slice(0, 10);
             const next = new Date(new Date(`${day}T00:00:00`).getTime() + 86400000).toISOString().slice(0, 10);
@@ -2990,7 +3005,7 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
 
       // Edit an event on either calendar. Google edits sync to the real calendar.
       if (req.method === "POST" && url.pathname === "/calendar/update") {
-        const { source, id, title, start, end, notes, who } = JSON.parse((await readBody(req)) || "{}");
+        const { source, id, title, start, end, notes, who, private: priv } = JSON.parse((await readBody(req)) || "{}");
         if (!id || !source) return send(400, { error: "source and id required" });
         if (source === "local") {
           const events = load<CalEvent[]>("calendar", []);
@@ -3010,6 +3025,7 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
         const patch: any = {};
         if (title) patch.summary = title;
         if (notes !== undefined) patch.location = notes;
+        if (priv !== undefined) patch.visibility = priv ? "private" : "default";
         if (start) {
           patch.start = { dateTime: new Date(start).toISOString() };
           const endMs = end ? new Date(end).getTime() : new Date(start).getTime() + 3600000;
