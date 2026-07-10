@@ -39,7 +39,7 @@ const TURN_CTX = new AsyncLocalStorage<{ sessionId?: string }>();
 // Set once in main(); lets tool handlers (e.g. fetch_webpage's PDF reader) make
 // their own model calls without threading the client through every signature.
 let ANTHROPIC: Anthropic | null = null;
-import { randomUUID } from "crypto";
+import { randomUUID, createHmac } from "crypto";
 
 // Keep in sync with package.json
 const VERSION = "0.1.0";
@@ -1210,13 +1210,59 @@ function logComm(entry: CommEntry) {
   save("comms", log.slice(-300));
 }
 
+// ── SMS consent (TCPA / Twilio toll-free) — nobody is texted without a record ─
+//
+// The account holder consented when they set up Homebase (their number is
+// ownerCallback). Anyone else gets ONE opt-in request and nothing more until
+// they reply YES to the Homebase number; replies land at POST /sms/webhook —
+// point the Twilio number's messaging webhook there.
+// Policy page: pursuearete.com/sms-opt-in
+
+interface SmsConsent {
+  status: "pending" | "opted_in" | "opted_out";
+  requestedAt?: string; // when the opt-in request went out
+  respondedAt?: string; // when they replied
+  reply?: string; // raw reply text — the auditable consent record
+  note?: string; // e.g. "account holder — consented at setup"
+  queued?: string[]; // messages held until YES (latest few)
+}
+
+const SMS_POLICY_URL = "pursuearete.com/sms-opt-in";
+
+const normPhone = (n: string) => n.replace(/[^\d+]/g, "");
+
+const consentRequestBody = (cfg: Config) =>
+  `${cfg.ownerName ?? "Your family"}'s Homebase assistant would like to send you texts — reminders, ` +
+  `lists, and household questions, usually a few per month. Reply YES to receive them, or ignore ` +
+  `this message to decline. Msg&data rates may apply. Reply STOP anytime. ${SMS_POLICY_URL}`;
+
+async function sendTwilioSms(cfg: Config, to: string, body: string): Promise<{ ok: boolean; detail: string }> {
+  const res = await fetch(
+    `https://api.twilio.com/2010-04-01/Accounts/${cfg.twilioAccountSid}/Messages.json`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: "Basic " + Buffer.from(`${cfg.twilioAccountSid}:${cfg.twilioAuthToken}`).toString("base64"),
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body: new URLSearchParams({ To: to, From: cfg.twilioFromNumber!, Body: body }),
+    }
+  );
+  const data: any = await res.json();
+  if (!res.ok) return { ok: false, detail: data.message ?? JSON.stringify(data) };
+  logComm({ at: new Date().toISOString(), type: "sms", direction: "out", party: to, summary: body.slice(0, 200), sessionId: TURN_CTX.getStore()?.sessionId });
+  return { ok: true, detail: `sid ${data.sid}, status ${data.status}` };
+}
+
 const smsTool: AgentTool = {
   schema: {
     name: "send_sms",
     description:
       "Send a text message (SMS) from the family agent's own Twilio number. Use for reminders, " +
       "sharing lists, or notifying a family member. ALWAYS confirm the recipient number and exact " +
-      "message text with the user before sending — never send unprompted. Numbers in E.164 (+1...).",
+      "message text with the user before sending — never send unprompted. Numbers in E.164 (+1...). " +
+      "Consent is handled for you: a first-time recipient gets a one-time 'reply YES' opt-in request " +
+      "and the message is queued until they confirm; recipients who texted STOP cannot be messaged.",
     input_schema: {
       type: "object",
       properties: {
@@ -1230,21 +1276,38 @@ const smsTool: AgentTool = {
     const cfg = vapiCfg(); // same fresh-config loader the call tools use
     if (!cfg.twilioAccountSid || !cfg.twilioAuthToken || !cfg.twilioFromNumber)
       return "SMS isn't configured. Add twilioAccountSid, twilioAuthToken, twilioFromNumber to " + FILE("config");
-    const res = await fetch(
-      `https://api.twilio.com/2010-04-01/Accounts/${cfg.twilioAccountSid}/Messages.json`,
-      {
-        method: "POST",
-        headers: {
-          Authorization: "Basic " + Buffer.from(`${cfg.twilioAccountSid}:${cfg.twilioAuthToken}`).toString("base64"),
-          "Content-Type": "application/x-www-form-urlencoded",
-        },
-        body: new URLSearchParams({ To: input.to, From: cfg.twilioFromNumber, Body: input.body }),
+    const to = normPhone(input.to);
+    const consent = load<Record<string, SmsConsent>>("sms-consent", {});
+    // The account holder consented at setup — seed their record on first text.
+    if (!consent[to] && cfg.ownerCallback && normPhone(cfg.ownerCallback) === to) {
+      consent[to] = { status: "opted_in", respondedAt: new Date().toISOString(), note: "account holder — consented at setup" };
+      save("sms-consent", consent);
+    }
+    const rec = consent[to];
+    if (rec?.status === "opted_out")
+      return `Can't text ${to} — they opted out${rec.respondedAt ? ` on ${rec.respondedAt.slice(0, 10)}` : ""}. Only they can undo that, by texting START to the Homebase number themselves.`;
+    if (!rec || rec.status === "pending") {
+      const askedRecently = !!rec?.requestedAt && Date.now() - Date.parse(rec.requestedAt) < 24 * 3600_000;
+      if (!askedRecently) {
+        const sent = await sendTwilioSms(cfg, to, consentRequestBody(cfg));
+        if (!sent.ok) return `SMS failed: ${sent.detail}`;
       }
-    );
-    const data: any = await res.json();
-    if (!res.ok) return `SMS failed: ${data.message ?? JSON.stringify(data)}`;
-    logComm({ at: new Date().toISOString(), type: "sms", direction: "out", party: input.to, summary: input.body.slice(0, 200), sessionId: TURN_CTX.getStore()?.sessionId });
-    return `Text sent to ${input.to} (sid ${data.sid}, status ${data.status}).`;
+      consent[to] = {
+        status: "pending",
+        requestedAt: askedRecently ? rec!.requestedAt : new Date().toISOString(),
+        queued: [...(rec?.queued ?? []), input.body].slice(-5),
+      };
+      save("sms-consent", consent);
+      return (
+        `${to} hasn't opted in to Homebase texts yet, so the message wasn't delivered. ` +
+        (askedRecently
+          ? "They already have a pending opt-in request from the last 24h; "
+          : "I sent them a one-time opt-in request; ") +
+        "the message is queued and sends automatically if they reply YES. Tell the user this."
+      );
+    }
+    const sent = await sendTwilioSms(cfg, to, input.body);
+    return sent.ok ? `Text sent to ${to} (${sent.detail}).` : `SMS failed: ${sent.detail}`;
   },
 };
 
@@ -2199,7 +2262,7 @@ interface FeedItem {
   body: string;
   sessionId?: string; // present = personal (one phone only); absent = household-wide
   dismissed?: boolean; // checked off on the Home page — hidden from alert surfaces
-  kind?: "briefing" | "nudge" | "call" | "vip" | "digest" | "tip"; // routing: only alert-worthy kinds hit Home/fridge
+  kind?: "briefing" | "nudge" | "call" | "vip" | "digest" | "tip" | "sms"; // routing: only alert-worthy kinds hit Home/fridge
 }
 
 // Kinds that belong on the shared "Family alerts" surfaces (Home page, fridge):
@@ -3006,6 +3069,51 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
           logComm({ at: new Date().toISOString(), type: "call", direction: "in", party: caller, summary: String(summary).slice(0, 200) });
         }
         return send(200, { ok: true });
+      }
+
+      // Twilio inbound SMS — YES/STOP/HELP replies from recipients. Point the
+      // Twilio number's messaging webhook at POST <publicUrl>/sms/webhook.
+      // Authenticated by X-Twilio-Signature (HMAC-SHA1 over URL + sorted params).
+      if (req.method === "POST" && url.pathname === "/sms/webhook") {
+        const cfg = load<Config>("config", {});
+        const twiml = (msg?: string) => {
+          res.writeHead(200, { "Content-Type": "text/xml" });
+          res.end(msg ? `<Response><Message>${msg}</Message></Response>` : "<Response/>");
+        };
+        const params = new URLSearchParams((await readBody(req)) || "");
+        if (cfg.twilioAuthToken && cfg.publicUrl) {
+          const payload =
+            `${cfg.publicUrl}/sms/webhook` +
+            [...params.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([k, v]) => k + v).join("");
+          const expected = createHmac("sha1", cfg.twilioAuthToken).update(payload).digest("base64");
+          if ((req.headers["x-twilio-signature"] ?? "") !== expected) return send(401, { error: "bad signature" });
+        }
+        const from = normPhone(params.get("From") ?? "");
+        const body = (params.get("Body") ?? "").trim();
+        if (!from) return twiml();
+        logComm({ at: new Date().toISOString(), type: "sms", direction: "in", party: from, summary: body.slice(0, 200) });
+        const word = (body.split(/\s+/)[0] ?? "").toUpperCase().replace(/[^A-Z]/g, "");
+        const consent = load<Record<string, SmsConsent>>("sms-consent", {});
+        const rec = consent[from];
+        const stamp = { respondedAt: new Date().toISOString(), reply: body.slice(0, 80) };
+        if (["STOP", "STOPALL", "UNSUBSCRIBE", "CANCEL", "END", "QUIT"].includes(word)) {
+          consent[from] = { ...rec, status: "opted_out", ...stamp, queued: [] };
+          save("sms-consent", consent);
+          return twiml(); // Twilio toll-free sends its own mandated STOP confirmation
+        }
+        if (["YES", "Y", "START", "UNSTOP", "CONFIRM"].includes(word)) {
+          const queued = rec?.queued ?? [];
+          consent[from] = { ...rec, status: "opted_in", ...stamp, queued: [] };
+          save("sms-consent", consent);
+          for (const m of queued) await sendTwilioSms(cfg, from, m);
+          return twiml("You're opted in — Homebase can text you now. Reply STOP anytime to opt out, HELP for help.");
+        }
+        if (["HELP", "INFO"].includes(word))
+          return twiml(`Homebase family assistant. Info: ${SMS_POLICY_URL}. Msg&data rates may apply. Reply STOP to opt out.`);
+        // Anything else: surface the reply to the household.
+        recordFeed("💬 Text message", `From ${from}: ${body.slice(0, 300)}`, undefined, "sms");
+        sendExpoPush("💬 Text message", `From ${from}: ${body.slice(0, 150)}`).catch(() => {});
+        return twiml();
       }
 
       // ── Fridge / wall display (own weak key; tablet browsers, kiosk mode) ──

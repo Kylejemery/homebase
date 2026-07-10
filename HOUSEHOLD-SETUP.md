@@ -55,6 +55,16 @@ OAuth consent screen (add your family as test users) → create TWO OAuth client
   each person connects their OWN email, and their inbox summaries appear ONLY
   on their own phone.
 
+## 5. SMS via Twilio (optional)
+
+Set `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_FROM_NUMBER` on Railway.
+Then in the Twilio console, point the number's **Messaging webhook** to
+`https://<your-domain>/sms/webhook` (HTTP POST) — this is how YES/STOP/HELP
+replies are processed. Consent is handled automatically: the first text to a
+new number sends a one-time "reply YES" opt-in request, and the real message
+delivers when they confirm. Your own number (`OWNER_CALLBACK`) is treated as
+already opted in. Opt-in policy page: pursuearete.com/sms-opt-in
+
 ## What you get
 
 - Chat with a family agent that manages lists, calendar, memory, weather
