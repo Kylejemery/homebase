@@ -117,6 +117,8 @@ interface Config {
   debriefTime?: string; // "HH:MM" — afternoon debrief (default 16:30)
   reflectionTime?: string; // "HH:MM" — silent nightly habit-learning pass (default 21:30)
   nudgeTime?: string; // "HH:MM" — evening look-ahead nudge, silent when nothing's notable (default 20:00)
+  tipTime?: string; // "HH:MM" — "Did you know?" capability tip check (default 18:00)
+  tipEveryDays?: number; // min days between tips for a given phone (default 7)
   twilioAccountSid?: string;
   twilioAuthToken?: string;
   twilioFromNumber?: string; // E.164 — the agent's own number
@@ -690,10 +692,15 @@ const gcalAddTool: AgentTool = {
       body.visibility = "private";
       // stamp the creating phone so only their calendar shows it
       const sid = TURN_CTX.getStore()?.sessionId;
-      if (sid) body.extendedProperties = { private: { homebaseOwner: sid } };
+      if (sid) {
+        body.extendedProperties = { private: { homebaseOwner: sid } };
+        markUsed(sid, "private_event");
+      }
     }
-    if (Array.isArray(input.attendees) && input.attendees.length)
+    if (Array.isArray(input.attendees) && input.attendees.length) {
       body.attendees = input.attendees.map((email: string) => ({ email: String(email).trim() }));
+      markUsed(TURN_CTX.getStore()?.sessionId, "calendar_invite"); // inviting ≠ merely adding an event
+    }
     if (input.all_day) {
       const day = input.start.slice(0, 10);
       const next = new Date(new Date(`${day}T00:00:00`).getTime() + 86400000).toISOString().slice(0, 10);
@@ -1818,6 +1825,8 @@ async function runAgentTurn(client: Anthropic, history: Anthropic.MessageParam[]
       let out: string;
       try {
         out = tool ? await tool.handler(block.input) : `Unknown tool ${block.name}`;
+        // a phone-driven turn using a tool = that capability has been discovered
+        if (tool) markUsed(TURN_CTX.getStore()?.sessionId, block.name);
       } catch (err: any) {
         out = `Tool error: ${err.message}`;
       }
@@ -2113,6 +2122,7 @@ function hydrateConfigFromEnv(cfg: Config) {
     ["debriefTime", process.env.DEBRIEF_TIME],
     ["reflectionTime", process.env.REFLECTION_TIME],
     ["nudgeTime", process.env.NUDGE_TIME],
+    ["tipTime", process.env.TIP_TIME],
     ["twilioAccountSid", process.env.TWILIO_ACCOUNT_SID],
     ["twilioAuthToken", process.env.TWILIO_AUTH_TOKEN],
     ["twilioFromNumber", process.env.TWILIO_FROM_NUMBER],
@@ -2121,6 +2131,8 @@ function hydrateConfigFromEnv(cfg: Config) {
   for (const [k, v] of map) if (v && (cfg as any)[k] !== v) { (cfg as any)[k] = v; dirty = true; }
   const ownerChat = Number(process.env.TELEGRAM_OWNER_CHAT_ID);
   if (ownerChat && cfg.telegramOwnerChatId !== ownerChat) { cfg.telegramOwnerChatId = ownerChat; dirty = true; }
+  const tipDays = Number(process.env.TIP_EVERY_DAYS);
+  if (tipDays && cfg.tipEveryDays !== tipDays) { cfg.tipEveryDays = tipDays; dirty = true; }
   // Google OAuth tokens as a JSON blob (copy from a local `--google-auth` run).
   // A new refresh_token means a new consent (e.g. scopes added) — adopt it even
   // over saved tokens; the stale expires_at just triggers a refresh on first use.
@@ -2187,7 +2199,7 @@ interface FeedItem {
   body: string;
   sessionId?: string; // present = personal (one phone only); absent = household-wide
   dismissed?: boolean; // checked off on the Home page — hidden from alert surfaces
-  kind?: "briefing" | "nudge" | "call" | "vip" | "digest"; // routing: only alert-worthy kinds hit Home/fridge
+  kind?: "briefing" | "nudge" | "call" | "vip" | "digest" | "tip"; // routing: only alert-worthy kinds hit Home/fridge
 }
 
 // Kinds that belong on the shared "Family alerts" surfaces (Home page, fridge):
@@ -2204,6 +2216,169 @@ function recordFeed(title: string, body: string, sessionId?: string, kind?: Feed
 
 const feedFor = (sessionId?: string) =>
   load<FeedItem[]>("feed", []).filter((f) => !f.sessionId || f.sessionId === sessionId);
+
+// ── Capability usage + "Did you know?" tips ─────────────────────────────────
+// Which capabilities each phone has actually exercised — the signal for suggesting
+// the ones it hasn't. Keyed by sessionId; background jobs run without a session
+// and so record nothing (a briefing calling a tool isn't the user discovering it).
+
+type Usage = Record<string, Record<string, string>>; // sessionId → capability key → last-used ISO
+
+function markUsed(sessionId: string | undefined, key: string) {
+  if (!sessionId) return;
+  const usage = load<Usage>("usage", {});
+  (usage[sessionId] ??= {})[key] = new Date().toISOString();
+  save("usage", usage);
+}
+
+// Tip copy is STATIC on purpose: it costs no tokens and can never invent a
+// capability that doesn't exist. Every `evidence` key is either a real tool name
+// (see TOOLS) or an endpoint key passed to markUsed().
+interface Capability {
+  id: string;
+  title: string;
+  blurb: string;
+  evidence: string[]; // any of these keys in `usage` means this phone already found it
+}
+
+const CAPABILITIES: Capability[] = [
+  {
+    id: "phone_call",
+    title: "Homebase can call places for you",
+    blurb: 'Try: "call Dr. Lee\'s office and book a cleaning." It reads you the briefing and confirms before it dials — and it always says it\'s an AI assistant.',
+    evidence: ["make_phone_call", "check_phone_call"],
+  },
+  {
+    id: "sms",
+    title: "It can text people for you",
+    blurb: 'Try: "text Aundrea that I\'m running 10 minutes late." It shows you the exact message and waits for your OK before sending.',
+    evidence: ["send_sms"],
+  },
+  {
+    id: "calendar_edit",
+    title: "It can reschedule an appointment",
+    blurb: 'Try: "move my dentist appointment to 3pm Thursday." It finds the event, confirms the change, and anyone invited gets the update automatically.',
+    evidence: ["google_calendar_update"],
+  },
+  {
+    id: "private_event",
+    title: "Some things are nobody else's business",
+    blurb: 'Say "keep this private" when adding an event — it lives on your calendar only, and stays off the family calendar, the briefings, and the fridge.',
+    evidence: ["private_event"],
+  },
+  {
+    id: "calendar_invite",
+    title: "It can send real calendar invites",
+    blurb: 'Try: "add dinner Saturday 7pm and invite Grandma." Google emails her an Accept/Decline invite. It asks before inviting anyone.',
+    evidence: ["calendar_invite"],
+  },
+  {
+    id: "commitments",
+    title: "It can follow up later, so you don't have to",
+    blurb: 'Try: "remind me Tuesday if the plumber hasn\'t called back." It surfaces the follow-up in your briefing — and never acts on it without asking.',
+    evidence: ["manage_commitments"],
+  },
+  {
+    id: "email_vips",
+    title: "Get alerted the moment someone important emails",
+    blurb: 'Try: "tell me whenever the school emails." You\'ll get a push within ~10 minutes of their next message. The list is yours alone.',
+    evidence: ["manage_email_vips"],
+  },
+  {
+    id: "inbox",
+    title: "Ask what actually matters in your inbox",
+    blurb: 'Try: "anything important in my email?" It reads your own inbox (tap ✉ to connect it) and summarizes only what matters. Summaries stay on your phone.',
+    evidence: ["gmail_summary"],
+  },
+  {
+    id: "send_email",
+    title: "It can write and send email from your inbox",
+    blurb: 'Try: "email the coach that Nora will miss practice Friday." It shows you the full draft and only sends once you approve.',
+    evidence: ["send_email"],
+  },
+  {
+    id: "doc_scan",
+    title: "Photograph a document and it remembers it",
+    blurb: "Tap 📄 in the header and snap an insurance card, a router label, or a school calendar. It pulls out the details and remembers them for you.",
+    evidence: ["doc_scan"],
+  },
+  {
+    id: "list_scan",
+    title: "Photograph a printed list to fill a list",
+    blurb: 'Tap 📷 Scan on the Lists tab and photograph a school-supply sheet or packing list — it turns it into checkable items.',
+    evidence: ["list_scan"],
+  },
+  {
+    id: "recipe_import",
+    title: "Turn a recipe into groceries",
+    blurb: "Tap ＋ Recipe on the Lists tab and paste a recipe link (or photograph the page) — every ingredient lands on the grocery list.",
+    evidence: ["recipe_import"],
+  },
+  {
+    id: "email_links",
+    title: "It can open the links buried in your email",
+    blurb: 'School newsletters often just link to the real details. Try: "check the school email and tell me the dates" — it opens the link, reads it, and offers to add the dates.',
+    evidence: ["fetch_webpage"],
+  },
+  {
+    id: "memory",
+    title: "It remembers the things you always forget",
+    blurb: 'Try: "remember Nora wears size 13 shoes" or ask "what size shoe does Nora wear?" It picks up useful facts on its own, too.',
+    evidence: ["family_memory"],
+  },
+  {
+    id: "contacts",
+    title: "Save people once, use them everywhere",
+    blurb: 'Try: "Grandma\'s number is 919-555-0134." After that, "call Grandma" and "invite Grandma" just work.',
+    evidence: ["manage_contacts"],
+  },
+  {
+    id: "weather",
+    title: "Weather, without leaving the chat",
+    blurb: 'Try: "do the kids need jackets tomorrow?" — it\'s in the morning briefing too.',
+    evidence: ["get_weather"],
+  },
+];
+
+// Per-phone tip state: when we last sent one, and which we've already sent.
+interface TipState {
+  lastSentAt: string;
+  sent: string[];
+}
+
+// One unused capability per phone, at most one per `tipEveryDays`. Goes quiet on
+// its own once a phone has seen (or used) everything — no barrel-scraping.
+// `force` skips only the time gate (for POST /tips testing), never the "already
+// sent" / "already used" rules.
+async function runCapabilityTips(force = false): Promise<string> {
+  const cfg = load<Config>("config", {});
+  const everyDays = cfg.tipEveryDays ?? 7;
+  const pushReg = load<Record<string, string>>("push", {});
+  const usage = load<Usage>("usage", {});
+  const tips = load<Record<string, TipState>>("tips", {});
+  const now = Date.now();
+  let sent = 0;
+
+  for (const sessionId of Object.keys(pushReg)) {
+    const state = tips[sessionId];
+    if (!force && state && now - new Date(state.lastSentAt).getTime() < everyDays * 86400000) continue;
+    const used = usage[sessionId] ?? {};
+    const alreadySent = new Set(state?.sent ?? []);
+    const next = CAPABILITIES.find(
+      (c) => !alreadySent.has(c.id) && !c.evidence.some((k) => k in used)
+    );
+    if (!next) continue; // this phone has found everything — stay silent
+
+    const body = `${next.title}\n\n${next.blurb}`;
+    recordFeed("💡 Did you know?", body, sessionId, "tip");
+    await sendExpoPush("💡 Did you know?", body, sessionId).catch(() => {});
+    tips[sessionId] = { lastSentAt: new Date().toISOString(), sent: [...alreadySent, next.id] };
+    sent++;
+  }
+
+  save("tips", tips);
+  return sent ? `Sent ${sent} capability tip(s).` : "No tips due.";
+}
 
 // Local + Google events for a window — the one calendar the whole household sees.
 type MergedEvent = { id: string; title: string; start: string; end?: string; who?: string; notes?: string; source: string };
@@ -2914,7 +3089,9 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
         // "yes, add that one" after a nudge/briefing has something to refer to.
         const feed = feedFor(sessionId);
         const reads = load<Record<string, string>>("feed-read", {});
-        const unread = feed.filter((f) => f.at > (reads[sessionId] ?? "")).slice(-3);
+        // tips are self-explanatory in the chat feed — don't hand them to the agent,
+        // or it starts parroting its own "did you know" copy back at the user
+        const unread = feed.filter((f) => f.at > (reads[sessionId] ?? "") && f.kind !== "tip").slice(-3);
         if (unread.length) {
           prefixes.push(
             `[system note — notifications recently sent: ${unread.map((f) => `${f.title}: ${f.body.slice(0, 400)}`).join(" ||| ")}]`
@@ -2950,6 +3127,13 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
         if (kind === "reflection") return send(200, { report: await runNightlyReflection(client) });
         if (kind === "nudge") return send(200, { report: await runNudgeAndDeliver(client) });
         return send(200, { report: await runBriefingAndDeliver(client, kind === "debrief" ? "debrief" : "morning") });
+      }
+
+      // Run the "Did you know?" capability tips now. { force: true } skips the
+      // per-phone time gate (testing); the unused/already-sent rules still apply.
+      if (req.method === "POST" && url.pathname === "/tips") {
+        const { force } = JSON.parse((await readBody(req)) || "{}");
+        return send(200, { report: await runCapabilityTips(!!force) });
       }
 
       if (req.method === "POST" && url.pathname === "/register-push") {
@@ -3069,7 +3253,10 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
           if (priv) {
             body.visibility = "private";
             // stamp the creating phone so only their calendar shows it
-            if (sessionId) body.extendedProperties = { private: { homebaseOwner: sessionId } };
+            if (sessionId) {
+              body.extendedProperties = { private: { homebaseOwner: sessionId } };
+              markUsed(sessionId, "private_event");
+            }
           }
           if (allDay) {
             const day = String(start).slice(0, 10);
@@ -3214,6 +3401,7 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
         const ingredients = await extractIngredients(client, body);
         if (!ingredients.length) return send(200, { added: [], message: "No ingredients found — is that a recipe?" });
         const added = addToList(body.list ? String(body.list).toLowerCase() : "grocery", ingredients);
+        markUsed(body.sessionId, "recipe_import");
         return send(200, { added });
       }
 
@@ -3224,6 +3412,7 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
         const items = await extractListItems(client, body);
         if (!items.length) return send(200, { added: [], message: "Couldn't find list items in that photo." });
         const added = addToList(body.list ? String(body.list).toLowerCase() : "grocery", items);
+        markUsed(body.sessionId, "list_scan");
         return send(200, { added });
       }
 
@@ -3236,6 +3425,7 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
         const mem = load<Record<string, string>>("memory", {});
         for (const f of facts) mem[f.key] = f.fact;
         save("memory", mem);
+        markUsed(body.sessionId, "doc_scan");
         return send(200, { summary, stored: facts });
       }
 
@@ -3275,6 +3465,8 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
   daily("morning briefing", cfg.briefingTime ?? "07:00", () => runBriefingAndDeliver(client, "morning"));
   daily("afternoon debrief", cfg.debriefTime ?? "16:30", () => runBriefingAndDeliver(client, "debrief"));
   daily("evening nudge", cfg.nudgeTime ?? "20:00", () => runNudgeAndDeliver(client));
+  // ticks daily; the per-phone tipEveryDays gate makes it weekly and self-staggering
+  daily("did you know", cfg.tipTime ?? "18:00", () => runCapabilityTips());
   daily("nightly reflection", cfg.reflectionTime ?? "21:30", () => runNightlyReflection(client));
 }
 
