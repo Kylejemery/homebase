@@ -635,8 +635,13 @@ const gcalListTool: AgentTool = {
     );
     const data: any = await res.json();
     if (!res.ok) return `Google Calendar error: ${data.error?.message ?? res.status}`;
-    // private events never surface through the agent (briefings go to the whole family)
-    const items = (data.items ?? []).filter((e: any) => e.visibility !== "private" && e.visibility !== "confidential");
+    // private events surface only to the phone that created them (owner stamp);
+    // the household briefing path passes no sessionId, so private stays off it
+    const sid = TURN_CTX.getStore()?.sessionId;
+    const items = (data.items ?? []).filter((e: any) => {
+      if (e.visibility !== "private" && e.visibility !== "confidential") return true;
+      return sid && e.extendedProperties?.private?.homebaseOwner === sid;
+    });
     // include the event id so the agent can reference an event for google_calendar_update
     return items.length
       ? items.map((e: any) => `${gcalFmt(e)}  [id: ${e.id}]`).join("\n")
@@ -681,7 +686,12 @@ const gcalAddTool: AgentTool = {
     const token = await googleAccessToken();
     if (!token) return GCAL_NOT_CONNECTED;
     const body: any = { summary: input.title, location: input.location, description: input.notes };
-    if (input.private) body.visibility = "private";
+    if (input.private) {
+      body.visibility = "private";
+      // stamp the creating phone so only their calendar shows it
+      const sid = TURN_CTX.getStore()?.sessionId;
+      if (sid) body.extendedProperties = { private: { homebaseOwner: sid } };
+    }
     if (Array.isArray(input.attendees) && input.attendees.length)
       body.attendees = input.attendees.map((email: string) => ({ email: String(email).trim() }));
     if (input.all_day) {
@@ -769,7 +779,12 @@ const gcalUpdateTool: AgentTool = {
     if (input.title !== undefined) patch.summary = input.title;
     if (input.location !== undefined) patch.location = input.location;
     if (input.notes !== undefined) patch.description = input.notes;
-    if (input.private !== undefined) patch.visibility = input.private ? "private" : "default";
+    if (input.private !== undefined) {
+      patch.visibility = input.private ? "private" : "default";
+      // stamp the creating phone so only their calendar shows a newly-private event
+      const sid = TURN_CTX.getStore()?.sessionId;
+      if (input.private && sid) patch.extendedProperties = { private: { homebaseOwner: sid } };
+    }
     if (input.all_day && input.start) {
       const day = input.start.slice(0, 10);
       const next = new Date(new Date(`${day}T00:00:00`).getTime() + 86400000).toISOString().slice(0, 10);
@@ -1041,7 +1056,7 @@ const sendEmailTool: AgentTool = {
         ? "Your email connection doesn't have send permission yet — tap ✉ in the app to reconnect (the new consent includes sending)."
         : `Send failed: ${data.error?.message ?? res.status}`;
     }
-    logComm({ at: new Date().toISOString(), type: "email", direction: "out", party: input.to, summary: `${input.subject} — ${input.body.slice(0, 150)}` });
+    logComm({ at: new Date().toISOString(), type: "email", direction: "out", party: input.to, summary: `${input.subject} — ${input.body.slice(0, 150)}`, sessionId: sid ?? undefined });
     return `Email sent to ${input.to} (subject: "${input.subject}").`;
   },
 };
@@ -1179,6 +1194,7 @@ interface CommEntry {
   direction: "in" | "out";
   party: string; // the other number or address
   summary: string;
+  sessionId?: string; // present = personal (only the initiating phone sees it); absent = household-shared (e.g. inbound)
 }
 
 function logComm(entry: CommEntry) {
@@ -1220,7 +1236,7 @@ const smsTool: AgentTool = {
     );
     const data: any = await res.json();
     if (!res.ok) return `SMS failed: ${data.message ?? JSON.stringify(data)}`;
-    logComm({ at: new Date().toISOString(), type: "sms", direction: "out", party: input.to, summary: input.body.slice(0, 200) });
+    logComm({ at: new Date().toISOString(), type: "sms", direction: "out", party: input.to, summary: input.body.slice(0, 200), sessionId: TURN_CTX.getStore()?.sessionId });
     return `Text sent to ${input.to} (sid ${data.sid}, status ${data.status}).`;
   },
 };
@@ -1317,7 +1333,7 @@ const phoneCallTool: AgentTool = {
       status: "in-progress",
     });
     save("calls", calls);
-    logComm({ at: new Date().toISOString(), type: "call", direction: "out", party: input.phone_number, summary: input.briefing.slice(0, 200) });
+    logComm({ at: new Date().toISOString(), type: "call", direction: "out", party: input.phone_number, summary: input.briefing.slice(0, 200), sessionId: TURN_CTX.getStore()?.sessionId });
     PENDING_FOLLOWUPS.push(data.id);
     return `Call placed (id: ${data.id}). Dialing ${input.phone_number} now. I'll follow up with the outcome automatically, or use check_phone_call to check sooner.`;
   },
@@ -2192,7 +2208,10 @@ const feedFor = (sessionId?: string) =>
 // Local + Google events for a window — the one calendar the whole household sees.
 type MergedEvent = { id: string; title: string; start: string; end?: string; who?: string; notes?: string; source: string };
 
-async function mergedCalendar(start: Date, days: number): Promise<MergedEvent[]> {
+// sessionId (optional): a private event is included only for the phone that created
+// it (stamped as extendedProperties.private.homebaseOwner). Family-wide surfaces
+// (briefings, fridge) call this WITHOUT a sessionId, so every private event stays off.
+async function mergedCalendar(start: Date, days: number, sessionId?: string): Promise<MergedEvent[]> {
   const horizon = new Date(start.getTime() + days * 86400000);
   const events: MergedEvent[] = load<CalEvent[]>("calendar", [])
     .filter((e) => new Date(e.start) >= start && new Date(e.start) <= horizon)
@@ -2213,8 +2232,12 @@ async function mergedCalendar(start: Date, days: number): Promise<MergedEvent[]>
       )
     ).json();
     for (const e of g.items ?? []) {
-      // Events marked private in Google stay off every family surface.
-      if (e.visibility === "private" || e.visibility === "confidential") continue;
+      // Private events surface only on the calendar of the phone that created them
+      // (owner stamp). No sessionId (family surfaces) → every private event is skipped.
+      if (e.visibility === "private" || e.visibility === "confidential") {
+        const owner = e.extendedProperties?.private?.homebaseOwner;
+        if (!sessionId || owner !== sessionId) continue;
+      }
       events.push({
         id: String(e.id),
         title: e.summary ?? "(untitled)",
@@ -2971,7 +2994,14 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
 
       // Communication log — calls + texts, in and out, newest first (comms screen).
       if (req.method === "GET" && url.pathname === "/communications") {
-        return send(200, { items: load<CommEntry[]>("comms", []).slice(-100).reverse() });
+        // "mine + shared inbound": a phone sees comms it initiated (matching sessionId)
+        // plus any unowned entries (inbound calls/texts to the household number).
+        const sid = url.searchParams.get("sessionId") ?? undefined;
+        const items = load<CommEntry[]>("comms", [])
+          .filter((e) => !e.sessionId || e.sessionId === sid)
+          .slice(-100)
+          .reverse();
+        return send(200, { items });
       }
 
       // ── Structured data for the app's Grocery + Calendar screens ──────────
@@ -3025,17 +3055,22 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
         const days = Math.min(62, Number(url.searchParams.get("days")) || 14);
         const from = url.searchParams.get("from"); // YYYY-MM-DD → month views
         const start = from ? new Date(`${from}T00:00:00`) : new Date();
-        return send(200, { events: await mergedCalendar(start, days) });
+        const sid = url.searchParams.get("sessionId") ?? undefined; // include this phone's private events
+        return send(200, { events: await mergedCalendar(start, days, sid) });
       }
 
       // Add an event from the app's calendar form (Google when connected, else local).
       if (req.method === "POST" && url.pathname === "/calendar/add") {
-        const { title, start, end, who, notes, allDay, private: priv } = JSON.parse((await readBody(req)) || "{}");
+        const { title, start, end, who, notes, allDay, private: priv, sessionId } = JSON.parse((await readBody(req)) || "{}");
         if (!title || !start) return send(400, { error: "title and start required" });
         const gtoken = await googleAccessToken();
         if (gtoken) {
           const body: any = { summary: title, location: notes };
-          if (priv) body.visibility = "private";
+          if (priv) {
+            body.visibility = "private";
+            // stamp the creating phone so only their calendar shows it
+            if (sessionId) body.extendedProperties = { private: { homebaseOwner: sessionId } };
+          }
           if (allDay) {
             const day = String(start).slice(0, 10);
             const next = new Date(new Date(`${day}T00:00:00`).getTime() + 86400000).toISOString().slice(0, 10);
@@ -3078,7 +3113,8 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
         const hourNow = Number(
           new Intl.DateTimeFormat("en-US", { timeZone: tz, hourCycle: "h23", hour: "2-digit" }).format(now)
         );
-        const all = await mergedCalendar(new Date(now.getTime() - 86400000), 3);
+        const sid = url.searchParams.get("sessionId") ?? undefined; // this phone's own private events show on their Home
+        const all = await mergedCalendar(new Date(now.getTime() - 86400000), 3, sid);
         const notOver = (e: MergedEvent) => {
           if (!e.start.includes("T")) return true; // all-day stays all day
           const endMs = e.end?.includes("T") ? new Date(e.end).getTime() : new Date(e.start).getTime() + 3600000;
@@ -3105,7 +3141,7 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
 
       // Edit an event on either calendar. Google edits sync to the real calendar.
       if (req.method === "POST" && url.pathname === "/calendar/update") {
-        const { source, id, title, start, end, notes, who, private: priv } = JSON.parse((await readBody(req)) || "{}");
+        const { source, id, title, start, end, notes, who, private: priv, sessionId } = JSON.parse((await readBody(req)) || "{}");
         if (!id || !source) return send(400, { error: "source and id required" });
         if (source === "local") {
           const events = load<CalEvent[]>("calendar", []);
@@ -3125,7 +3161,11 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
         const patch: any = {};
         if (title) patch.summary = title;
         if (notes !== undefined) patch.location = notes;
-        if (priv !== undefined) patch.visibility = priv ? "private" : "default";
+        if (priv !== undefined) {
+          patch.visibility = priv ? "private" : "default";
+          // stamp the creating phone so only their calendar shows a newly-private event
+          if (priv && sessionId) patch.extendedProperties = { private: { homebaseOwner: sessionId } };
+        }
         if (start) {
           patch.start = gTime(start);
           patch.end = end ? gTime(end) : gTime(hasOffset(start)
