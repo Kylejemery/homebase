@@ -1493,6 +1493,51 @@ const checkCallTool: AgentTool = {
   },
 };
 
+// ── Notification preferences — per-phone mute switches for scheduled pushes ─
+
+const notifTool: AgentTool = {
+  schema: {
+    name: "manage_notifications",
+    description:
+      "The asking person's mute switches for the scheduled push notifications: 'briefing' (morning), " +
+      "'debrief' (afternoon), 'nudge' (evening heads-up). Per-phone — muting your briefing doesn't affect " +
+      "anyone else's. Use when someone says e.g. 'turn off my 7am briefing' or 'stop the evening nudges'. " +
+      "Actions: 'status' (show current switches), 'set' (job + enabled true/false).",
+    input_schema: {
+      type: "object",
+      properties: {
+        action: { type: "string", enum: ["status", "set"] },
+        job: { type: "string", enum: ["briefing", "debrief", "nudge"] },
+        enabled: { type: "boolean" },
+      },
+      required: ["action"],
+    },
+  },
+  handler: async (input) => {
+    const sid = TURN_CTX.getStore()?.sessionId;
+    if (!sid) return "Notification switches are per-phone — this only works from the app chat.";
+    const cfg = load<Config>("config", {});
+    const times: Record<NotifJob, string> = {
+      briefing: cfg.briefingTime ?? "07:00",
+      debrief: cfg.debriefTime ?? "16:30",
+      nudge: cfg.nudgeTime ?? "20:00",
+    };
+    const prefs = load<Record<string, Partial<Record<NotifJob, boolean>>>>("notif-prefs", {});
+    if (input.action === "status") {
+      return (Object.keys(times) as NotifJob[])
+        .map((j) => `${j} (${times[j]}): ${jobEnabled(sid, j) ? "ON" : "OFF"}`)
+        .join("\n");
+    }
+    if (input.action === "set") {
+      if (!input.job || typeof input.enabled !== "boolean") return "Need job (briefing/debrief/nudge) and enabled true/false.";
+      prefs[sid] = { ...prefs[sid], [input.job as NotifJob]: input.enabled };
+      save("notif-prefs", prefs);
+      return `${input.job} notifications (${times[input.job as NotifJob]}) are now ${input.enabled ? "ON" : "OFF"} for this phone. Everyone else is unaffected.`;
+    }
+    return "Unknown action.";
+  },
+};
+
 // ── Family profile — powers the app's Home page ─────────────────────────────
 
 interface FamilyMember {
@@ -1695,7 +1740,7 @@ async function setupInboundAgent() {
 const TOOLS: AgentTool[] = [
   listsTool, calendarTool, memoryTool, weatherTool, filesTool,
   gcalListTool, gcalAddTool, gcalUpdateTool, gmailTool, sendEmailTool, emailVipsTool, fetchWebTool, contactsTool, smsTool,
-  phoneCallTool, checkCallTool, commitmentsTool, familyTool,
+  phoneCallTool, checkCallTool, commitmentsTool, familyTool, notifTool,
 ];
 
 // ── MCP client — consume external MCP servers as extra agent tools ──────────
@@ -1799,6 +1844,9 @@ body itself, use fetch_webpage on the relevant link to open it and read the real
 dates and offer to add them to the calendar (confirm before adding).
 CONFLICTS: when adding calendar events, watch for clashes — with existing events AND with known routines
 in family_memory habits — and mention them.
+NOTIFICATION SWITCHES: each person can mute/unmute their own scheduled pushes (morning briefing,
+afternoon debrief, evening nudge) via manage_notifications — "turn off my 7am briefing" flips just
+their phone. Offer this if someone complains about notification volume.
 PRIVATE EVENTS: when someone asks to keep an event off the family calendar ("just for me",
 "private", "the family doesn't need to see this"), add it with private:true — it stays on their
 Google Calendar but never appears on family surfaces, briefings, or the fridge. Offer this when
@@ -1992,16 +2040,20 @@ Reply with one line describing what you stored or "nothing new".
 TODAY'S CONVERSATIONS:
 ${transcript}`;
 
-// Deliver a message to every phone that registered via /register-push. Expo's
-// push API needs no key for sends; returns per-message tickets. Used by the
-// morning briefing (and available for call followups) so the app gets notified.
-async function sendExpoPush(title: string, body: string, onlySessionId?: string): Promise<string> {
+// Per-phone mute switches for the scheduled pushes. Default: everything on.
+type NotifJob = "briefing" | "debrief" | "nudge";
+const jobEnabled = (sid: string, job: NotifJob) =>
+  load<Record<string, Partial<Record<NotifJob, boolean>>>>("notif-prefs", {})[sid]?.[job] !== false;
+const eligibleSessions = (job: NotifJob) =>
+  Object.keys(load<Record<string, string>>("push", {})).filter((sid) => jobEnabled(sid, job));
+
+// Deliver a message to registered phones. Expo's push API needs no key for
+// sends. `onlySessionId` targets one phone; `job` targets everyone who hasn't
+// muted that scheduled job; neither = every registered phone.
+async function sendExpoPush(title: string, body: string, onlySessionId?: string, job?: NotifJob): Promise<string> {
   const registry = load<Record<string, string>>("push", {});
-  const tokens = onlySessionId
-    ? registry[onlySessionId]
-      ? [registry[onlySessionId]]
-      : []
-    : Object.values(registry);
+  const sids = onlySessionId ? [onlySessionId] : job ? eligibleSessions(job) : Object.keys(registry);
+  const tokens = sids.map((s) => registry[s]).filter(Boolean);
   if (!tokens.length) return "No registered push tokens.";
   const messages = tokens.map((to) => ({ to, title, body, sound: "default" }));
   const res = await fetch("https://exp.host/--/api/v2/push/send", {
@@ -2230,17 +2282,18 @@ function msUntil(timeStr: string, tz: string): number {
 
 async function runBriefingAndDeliver(client: Anthropic, kind: "morning" | "debrief" = "morning"): Promise<string> {
   const cfg = load<Config>("config", {});
-  const pushCount = Object.keys(load<Record<string, string>>("push", {})).length;
+  const job: NotifJob = kind === "debrief" ? "debrief" : "briefing";
+  const pushCount = eligibleSessions(job).length; // muted phones don't count
   const hasTelegram = !!(cfg.telegramBotToken && cfg.telegramOwnerChatId);
   if (!pushCount && !hasTelegram)
-    return "Skipped: no delivery targets (no registered phones, no Telegram owner).";
+    return "Skipped: no delivery targets (everyone muted this, or no phones/Telegram).";
   const task = kind === "debrief" ? AFTERNOON_DEBRIEF_TASK(cfg) : MORNING_BRIEFING_TASK(cfg);
   const title = kind === "debrief" ? "Afternoon debrief" : "Morning briefing";
   const history: Anthropic.MessageParam[] = [{ role: "user", content: task }];
   const result = await runAgentTurn(client, history, false);
   recordFeed(title, result, undefined, "briefing");
   const report: string[] = [];
-  if (pushCount) report.push(await sendExpoPush(title, result));
+  if (pushCount) report.push(await sendExpoPush(title, result, undefined, job));
   if (hasTelegram) {
     const r: any = await fetch(`https://api.telegram.org/bot${cfg.telegramBotToken}/sendMessage`, {
       method: "POST",
@@ -2523,6 +2576,7 @@ async function deliverPersonalEmailDigests(client: Anthropic, kind: "morning" | 
   let delivered = 0;
   for (const sessionId of Object.keys(users)) {
     if (!pushReg[sessionId]) continue;
+    if (!jobEnabled(sessionId, kind === "debrief" ? "debrief" : "briefing")) continue; // muted = no digest either
     try {
       const token = await userAccessToken(sessionId);
       if (!token) continue;
@@ -2593,7 +2647,7 @@ async function checkVipEmails(): Promise<void> {
 // something (the NOTHING sentinel suppresses delivery entirely — no noise).
 async function runNudgeAndDeliver(client: Anthropic): Promise<string> {
   const cfg = load<Config>("config", {});
-  const pushCount = Object.keys(load<Record<string, string>>("push", {})).length;
+  const pushCount = eligibleSessions("nudge").length;
   const hasTelegram = !!(cfg.telegramBotToken && cfg.telegramOwnerChatId);
   if (!pushCount && !hasTelegram) return "Skipped: no delivery targets.";
   const history: Anthropic.MessageParam[] = [{ role: "user", content: NUDGE_TASK(cfg) }];
@@ -2601,7 +2655,7 @@ async function runNudgeAndDeliver(client: Anthropic): Promise<string> {
   if (/^NOTHING\b/i.test(result)) return "Quiet night — nothing worth a nudge.";
   recordFeed("Heads up for tomorrow", result, undefined, "nudge");
   const report: string[] = [];
-  if (pushCount) report.push(await sendExpoPush("Heads up for tomorrow", result));
+  if (pushCount) report.push(await sendExpoPush("Heads up for tomorrow", result, undefined, "nudge"));
   if (hasTelegram) {
     const r: any = await fetch(`https://api.telegram.org/bot${cfg.telegramBotToken}/sendMessage`, {
       method: "POST",
