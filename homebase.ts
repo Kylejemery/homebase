@@ -186,14 +186,17 @@ const listsTool: AgentTool = {
     description:
       "Manage named household lists (e.g. 'grocery', 'todos', 'packing', 'hardware store'). " +
       "Actions: 'show' one list or all lists, 'add' an item, 'check' (mark done) by id, " +
-      "'remove' by id, 'clear_done' to purge completed items from a list.",
+      "'remove' by id, 'clear_done' to purge completed items from a list, 'rename_list' (list → new_name), " +
+      "'delete_list' to remove a whole list and its items. The grocery list can't be renamed or deleted. " +
+      "Confirm with the user before delete_list unless they explicitly asked for it.",
     input_schema: {
       type: "object",
       properties: {
-        action: { type: "string", enum: ["show", "add", "check", "remove", "clear_done"] },
+        action: { type: "string", enum: ["show", "add", "check", "remove", "clear_done", "rename_list", "delete_list"] },
         list: { type: "string", description: "List name, lowercase. Omit with 'show' to see all lists." },
         item: { type: "string", description: "Item text (for 'add')" },
         id: { type: "number", description: "Item id (for 'check'/'remove')" },
+        new_name: { type: "string", description: "New list name (for 'rename_list')" },
       },
       required: ["action"],
     },
@@ -244,11 +247,41 @@ const listsTool: AgentTool = {
         save("lists", lists);
         return `Cleared ${before - lists[name].length} completed item(s) from ${name}.`;
       }
+      case "rename_list":
+        return renameList(name ?? "", input.new_name ?? "").message;
+      case "delete_list":
+        return deleteList(name ?? "").message;
       default:
         return "Unknown action.";
     }
   },
 };
+
+// Grocery is load-bearing (restock, recipe import, fridge display), so it stays put.
+function renameList(from: string, to: string): { ok: boolean; message: string } {
+  const lists = load<Lists>("lists", {});
+  const target = to.toLowerCase().trim();
+  if (!lists[from]) return { ok: false, message: `No list '${from}'.` };
+  if (from === "grocery") return { ok: false, message: "The grocery list can't be renamed." };
+  if (!target) return { ok: false, message: "New name required." };
+  if (target === from) return { ok: true, message: `'${from}' unchanged.` };
+  if (lists[target]) return { ok: false, message: `A list named '${target}' already exists.` };
+  // rebuild so the renamed list keeps its position
+  const next: Lists = {};
+  for (const [k, v] of Object.entries(lists)) next[k === from ? target : k] = v;
+  save("lists", next);
+  return { ok: true, message: `Renamed '${from}' to '${target}'.` };
+}
+
+function deleteList(name: string): { ok: boolean; message: string } {
+  const lists = load<Lists>("lists", {});
+  if (!lists[name]) return { ok: false, message: `No list '${name}'.` };
+  if (name === "grocery") return { ok: false, message: "The grocery list can't be deleted — clear its items instead." };
+  const count = lists[name].length;
+  delete lists[name];
+  save("lists", lists);
+  return { ok: true, message: `Deleted list '${name}' (${count} item${count === 1 ? "" : "s"}).` };
+}
 
 // ── Calendar (local event store) ───────────────────────────────────────────
 
@@ -1875,6 +1908,11 @@ you'll check back — then use check_phone_call when they ask, or on your next s
 
 const STRONG_MODEL = "claude-sonnet-4-5";
 const FAST_MODEL = "claude-haiku-4-5";
+// Photo reading (recipes, printed lists, documents). Phone photos put small print
+// through a JPEG + API downscale; on those Haiku and Sonnet 4.5 stop reading and
+// "complete" a plausible recipe from the title (invented achiote, dropped scallions).
+// Sonnet 5 transcribed every line in testing, and costs less than Sonnet 4.5.
+const VISION_MODEL = "claude-sonnet-5";
 
 const TRIVIAL_TURN =
   /^(add|put|buy)\b.{0,60}\b(to|on)\b.{0,40}\b(list|grocery|groceries|todos?|packing|shopping)\b|^(check( off)?|mark|uncheck|complete)\b.{0,50}(#?\d+|done)|^(show|what'?s on)\b.{0,30}\b(list|lists|grocery|groceries|todos?|packing|shopping)\b/i;
@@ -2035,7 +2073,7 @@ const REFLECTION_TASK = (transcript: string) =>
 habits or preferences worth remembering long-term (recurring requests, standing preferences,
 schedules — NOT one-off facts already stored). Store each with family_memory using a key
 prefixed 'habit-' (update existing habit keys if refined). If nothing new, store nothing.
-Reply with one line describing what you stored or "nothing new".
+Your reply text is discarded (the memory writes are the result) — reply with just "done".
 
 TODAY'S CONVERSATIONS:
 ${transcript}`;
@@ -2180,6 +2218,7 @@ async function telegramMode(client: Anthropic, cfg: Config) {
 
       const history = sessions.get(chatId) ?? [];
       sessions.set(chatId, history);
+      logChat(String(chatId), text);
       history.push({ role: "user", content: `[from ${msg.from?.first_name ?? "family member"}] ${text}` });
       try {
         const reply = await runAgentTurn(client, history, false);
@@ -2669,19 +2708,48 @@ async function runNudgeAndDeliver(client: Anthropic): Promise<string> {
 
 // Nightly habit learning: feed today's conversations back through the agent so
 // it stores durable patterns via family_memory. Silent — no delivery.
+// Timestamped record of what people typed — the reflection's input. Session
+// histories carry no timestamps, so reading them re-served old chats every night.
+interface ChatLogEntry { at: string; sid: string; text: string }
+function logChat(sid: string, text: string) {
+  const cutoff = Date.now() - 7 * 86400000;
+  const log = load<ChatLogEntry[]>("chat-log", []).filter((e) => Date.parse(e.at) > cutoff);
+  log.push({ at: new Date().toISOString(), sid, text: text.slice(0, 300) });
+  save("chat-log", log.slice(-2000));
+}
+
+// Reflects only on messages since the previous run (at most 24h back). Returns a
+// one-line result built from the memory writes actually made — the model's
+// deliberation stays out of the logs.
 async function runNightlyReflection(client: Anthropic): Promise<string> {
-  const stored = load<StoredSessions>("sessions", {});
-  // Sessions don't carry timestamps, so "today" ≈ the trailing window of each session.
-  const lines: string[] = [];
-  for (const [id, history] of Object.entries(stored)) {
-    for (const m of history.slice(-20)) {
-      if (m.role === "user" && typeof m.content === "string" && !m.content.startsWith("[system note"))
-        lines.push(`[${id}] ${m.content.slice(0, 300)}`);
+  const now = Date.now();
+  const state = load<{ lastRun?: string }>("reflection-state", {});
+  const since = Math.max(now - 86400000, state.lastRun ? Date.parse(state.lastRun) : 0);
+  const entries = load<ChatLogEntry[]>("chat-log", []).filter((e) => {
+    const t = Date.parse(e.at);
+    return t > since && t <= now;
+  });
+  const convos = new Set(entries.map((e) => e.sid)).size;
+  if (entries.length < 3) {
+    save("reflection-state", { lastRun: new Date(now).toISOString() });
+    return `nothing stored (${entries.length} message${entries.length === 1 ? "" : "s"} since last run, too few to learn from)`;
+  }
+  const transcript = entries.slice(-60).map((e) => `[${e.sid}] ${e.text}`).join("\n");
+  const history: Anthropic.MessageParam[] = [{ role: "user", content: REFLECTION_TASK(transcript) }];
+  await runAgentTurn(client, history, false);
+  save("reflection-state", { lastRun: new Date(now).toISOString() });
+  const stored: string[] = [];
+  for (const m of history) {
+    if (m.role !== "assistant" || !Array.isArray(m.content)) continue;
+    for (const b of m.content) {
+      const inp = b.type === "tool_use" && b.name === "family_memory" ? (b.input as any) : null;
+      if (inp?.action === "remember" && inp.key) stored.push(`${inp.key} = ${String(inp.fact ?? "").slice(0, 120)}`);
     }
   }
-  if (lines.length < 3) return "Skipped: not enough conversation today to learn from.";
-  const history: Anthropic.MessageParam[] = [{ role: "user", content: REFLECTION_TASK(lines.slice(-60).join("\n")) }];
-  return runAgentTurn(client, history, false);
+  const scope = `${entries.length} messages, ${convos} conversation${convos === 1 ? "" : "s"}`;
+  return stored.length
+    ? `stored ${stored.length} habit${stored.length === 1 ? "" : "s"} (${scope}): ${stored.join("; ")}`
+    : `nothing stored (${scope})`;
 }
 
 // ── Recipe → grocery ingredients (link or photo) ─────────────────────────────
@@ -2703,6 +2771,16 @@ function findJsonLdIngredients(html: string): string[] | null {
   }
   return null;
 }
+
+// Transcribe, don't summarize: the misses were aromatics, spices and garnishes,
+// which a "shopping list" framing let the model drop or paraphrase away.
+const PHOTO_INGREDIENTS_PROMPT =
+  `This photo shows a recipe. Transcribe EVERY ingredient line exactly as printed — every column and every ` +
+  `sub-section (e.g. "For the sauce", "To serve", "Garnish"), including spices, aromatics (onion, garlic, ` +
+  `scallions, chiles) and garnishes. Don't skip items the household probably already has. If a word is hard ` +
+  `to read, use the recipe's method text to confirm it rather than guessing a different ingredient. Reply with ` +
+  `ONLY a JSON array of strings, one per ingredient, keeping the quantity (e.g. "4 scallions, thinly sliced"). ` +
+  `If no recipe is visible, reply [].`;
 
 async function extractIngredients(
   client: Anthropic,
@@ -2730,13 +2808,17 @@ async function extractIngredients(
       },
       {
         type: "text",
-        text: 'Extract the recipe\'s ingredient list from this photo. Reply with ONLY a JSON array of strings, each a shopping-list item like "2 lbs chicken thighs". No commentary. If no recipe is visible, reply [].',
+        text: PHOTO_INGREDIENTS_PROMPT,
       },
     ];
   } else {
     return [];
   }
-  const resp = await createWithRetry(client, { model: FAST_MODEL, max_tokens: 1200, messages: [{ role: "user", content }] });
+  // Photos need the vision model; page text reads fine on the fast one. Sonnet 5
+  // thinks adaptively by default and that counts against max_tokens — leave room.
+  const resp = input.image
+    ? await createWithRetry(client, { model: VISION_MODEL, max_tokens: 8000, messages: [{ role: "user", content }] })
+    : await createWithRetry(client, { model: FAST_MODEL, max_tokens: 1200, messages: [{ role: "user", content }] });
   const text = resp.content.filter((b): b is Anthropic.TextBlock => b.type === "text").map((b) => b.text).join("");
   const match = text.match(/\[[\s\S]*\]/);
   if (!match) return [];
@@ -2748,15 +2830,15 @@ async function extractIngredients(
 }
 
 // Document memory: photo of a school calendar / insurance card / router label →
-// vision-extract the durable facts → family_memory. Strong model on purpose —
+// vision-extract the durable facts → family_memory. Vision model on purpose —
 // a misread policy number is worse than a slow scan.
 async function extractDocumentFacts(
   client: Anthropic,
   input: { image: string; mediaType?: string; hint?: string }
 ): Promise<{ summary: string; facts: { key: string; fact: string }[] }> {
   const resp = await createWithRetry(client, {
-    model: STRONG_MODEL,
-    max_tokens: 1500,
+    model: VISION_MODEL,
+    max_tokens: 8000,
     messages: [
       {
         role: "user",
@@ -2842,8 +2924,8 @@ async function extractListItems(
   input: { image: string; mediaType?: string; hint?: string }
 ): Promise<string[]> {
   const resp = await createWithRetry(client, {
-    model: FAST_MODEL,
-    max_tokens: 1200,
+    model: VISION_MODEL,
+    max_tokens: 8000,
     messages: [
       {
         role: "user",
@@ -2853,8 +2935,8 @@ async function extractListItems(
             type: "text",
             text:
               `This photo shows a list of items (school supply list, packing list, signup sheet, etc.).` +
-              `${input.hint ? ` The user says: "${input.hint}".` : ""} Extract every item as a JSON array of ` +
-              `strings, keeping quantities (e.g. "24 #2 pencils"). Reply with ONLY the JSON array. ` +
+              `${input.hint ? ` The user says: "${input.hint}".` : ""} Transcribe every item — every column and ` +
+              `section — as a JSON array of strings, keeping quantities (e.g. "24 #2 pencils"). Reply with ONLY the JSON array. ` +
               `If there's no list in the photo, reply [].`,
           },
         ],
@@ -3240,6 +3322,7 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
       if (req.method === "POST" && url.pathname === "/chat") {
         const { sessionId = "default", message } = JSON.parse((await readBody(req)) || "{}");
         if (!message || typeof message !== "string") return send(400, { error: "message (string) required" });
+        logChat(sessionId, message);
         const history = sessions.get(sessionId) ?? [];
         sessions.set(sessionId, history);
         sanitizeHistory(history); // repair sessions bricked by older followup injection
@@ -3395,6 +3478,18 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
         arr.splice(idx, 1);
         save("lists", lists);
         return send(200, { lists });
+      }
+
+      if (req.method === "POST" && url.pathname === "/lists/rename") {
+        const { list, name } = JSON.parse((await readBody(req)) || "{}");
+        const r = renameList(String(list ?? "").toLowerCase(), String(name ?? ""));
+        return send(r.ok ? 200 : 400, r.ok ? { lists: load<Lists>("lists", {}) } : { error: r.message });
+      }
+
+      if (req.method === "POST" && url.pathname === "/lists/delete") {
+        const { list } = JSON.parse((await readBody(req)) || "{}");
+        const r = deleteList(String(list ?? "").toLowerCase());
+        return send(r.ok ? 200 : 400, r.ok ? { lists: load<Lists>("lists", {}) } : { error: r.message });
       }
 
       if (req.method === "GET" && url.pathname === "/calendar") {
