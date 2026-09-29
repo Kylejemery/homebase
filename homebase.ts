@@ -39,7 +39,7 @@ const TURN_CTX = new AsyncLocalStorage<{ sessionId?: string }>();
 // Set once in main(); lets tool handlers (e.g. fetch_webpage's PDF reader) make
 // their own model calls without threading the client through every signature.
 let ANTHROPIC: Anthropic | null = null;
-import { randomUUID, createHmac } from "crypto";
+import { randomUUID, createHmac, randomBytes, createHash } from "crypto";
 
 // Keep in sync with package.json
 const VERSION = "0.1.0";
@@ -55,6 +55,7 @@ Usage:
   homebase --telegram            Telegram bot mode — family texts the agent
   homebase --serve               HTTP brain for the mobile app (PORT env or 8080)
   homebase --google-auth         connect Google Calendar (one-time OAuth in your browser)
+  homebase --skylight            sign in to Skylight (SKYLIGHT_EMAIL/PASSWORD) and list frames + lists
   homebase --setup-inbound       AI receptionist answers the household number (after Twilio import)
   homebase --version, -v         print version
   homebase --help, -h            show this help
@@ -3109,6 +3110,209 @@ document.getElementById("alerts").innerHTML=d.alerts.length?d.alerts.map(a=>\`<d
 setInterval(refresh,60000);refresh();
 </script></body></html>`;
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Skylight (frame) — unofficial, reverse-engineered API
+// ═══════════════════════════════════════════════════════════════════════════
+// Auth replays the Skylight app's OAuth2 authorization-code + PKCE flow (ported
+// from pyskylight's auth.py — the old POST /api/sessions login is retired):
+//   GET /oauth/authorize → Rails login page (csrf meta + session cookie)
+//   POST /auth/session (email, password) → redirects back to /oauth/authorize
+//   → redirect to REDIRECT_URI?code=… (never followed; code read from Location)
+//   POST /oauth/token (code + code_verifier) → access + refresh token
+// Credentials come from env (SKYLIGHT_EMAIL / SKYLIGHT_PASSWORD, Railway vars);
+// the token set is cached in HOMEBASE_DIR (the /data volume), never the repo.
+
+const SKY = {
+  base: "https://app.ourskylight.com",
+  clientId: "skylight-mobile",
+  redirectUri: "https://ourskylight.com/welcome",
+  scope: "everything",
+  apiVersion: "2026-05-01",
+  userAgent: "SkylightMobile (web)",
+};
+
+interface SkylightToken {
+  accessToken: string;
+  refreshToken?: string;
+  expiresAt?: number; // epoch ms
+}
+
+class SkylightAuthError extends Error {}
+
+const b64url = (buf: Buffer) => buf.toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+
+function skylightPkce(): { verifier: string; challenge: string } {
+  const verifier = b64url(randomBytes(64));
+  const challenge = b64url(createHash("sha256").update(verifier).digest());
+  return { verifier, challenge };
+}
+
+async function skylightTokenRequest(form: Record<string, string>): Promise<SkylightToken> {
+  const res = await fetch(`${SKY.base}/oauth/token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded", "User-Agent": SKY.userAgent },
+    body: new URLSearchParams(form).toString(),
+  });
+  const body: any = await res.json().catch(() => null);
+  if (res.status !== 200 || !body?.access_token) {
+    const detail = body?.error_description || body?.error || "";
+    throw new SkylightAuthError(`token endpoint returned HTTP ${res.status}${detail ? `: ${detail}` : ""}`);
+  }
+  return {
+    accessToken: body.access_token,
+    refreshToken: body.refresh_token,
+    expiresAt: typeof body.expires_in === "number" ? Date.now() + body.expires_in * 1000 : undefined,
+  };
+}
+
+async function skylightLogin(email: string, password: string): Promise<SkylightToken> {
+  const { verifier, challenge } = skylightPkce();
+  const state = b64url(randomBytes(24));
+  const jar = new Map<string, string>(); // private cookie jar for this login only
+
+  // Walk redirects by hand; stop at the redirect URI and lift the code off it.
+  const follow = async (method: string, url: string, form?: Record<string, string>) => {
+    for (let hop = 0; hop < 10; hop++) {
+      const res = await fetch(url, {
+        method,
+        redirect: "manual",
+        headers: {
+          "User-Agent": SKY.userAgent,
+          ...(jar.size ? { Cookie: [...jar].map(([k, v]) => `${k}=${v}`).join("; ") } : {}),
+          ...(form ? { "Content-Type": "application/x-www-form-urlencoded" } : {}),
+        },
+        body: form ? new URLSearchParams(form).toString() : undefined,
+      });
+      for (const c of res.headers.getSetCookie()) {
+        const [pair] = c.split(";");
+        const i = pair.indexOf("=");
+        if (i > 0) jar.set(pair.slice(0, i).trim(), pair.slice(i + 1).trim());
+      }
+      if (![301, 302, 303, 307, 308].includes(res.status)) return { page: await res.text(), code: null as string | null };
+      const loc = res.headers.get("location");
+      if (!loc) throw new SkylightAuthError(`HTTP ${res.status} redirect without a Location`);
+      const target = new URL(loc, url).toString();
+      if (target.startsWith(SKY.redirectUri)) {
+        const q = new URL(target).searchParams;
+        if (q.get("error")) throw new SkylightAuthError(`authorization denied: ${q.get("error")}`);
+        if (q.get("state") !== state) throw new SkylightAuthError("OAuth state mismatch; aborting login");
+        const code = q.get("code");
+        if (!code) throw new SkylightAuthError("redirect carried no authorization code");
+        return { page: null, code };
+      }
+      url = target;
+      form = undefined;
+      if ([301, 302, 303].includes(res.status)) method = "GET";
+    }
+    throw new SkylightAuthError("too many redirects during login");
+  };
+
+  const authorize = new URL(`${SKY.base}/oauth/authorize`);
+  for (const [k, v] of Object.entries({
+    client_id: SKY.clientId, response_type: "code", scope: SKY.scope, redirect_uri: SKY.redirectUri,
+    state, code_challenge: challenge, code_challenge_method: "S256",
+  })) authorize.searchParams.set(k, v);
+
+  let { page, code } = await follow("GET", authorize.toString());
+  if (!code) {
+    const csrf = page?.match(/<meta[^>]+name=["']csrf-token["'][^>]+content=["']([^"']+)["']/i)?.[1];
+    if (!csrf) throw new SkylightAuthError("could not find a CSRF token on the login page");
+    const unescaped = csrf.replace(/&amp;/g, "&").replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">");
+    ({ code } = await follow("POST", `${SKY.base}/auth/session`, { authenticity_token: unescaped, email, password }));
+  }
+  if (!code) throw new SkylightAuthError("login did not yield an authorization code; check SKYLIGHT_EMAIL / SKYLIGHT_PASSWORD");
+
+  return skylightTokenRequest({
+    grant_type: "authorization_code", client_id: SKY.clientId, code, redirect_uri: SKY.redirectUri, code_verifier: verifier,
+  });
+}
+
+// Token lifecycle: cached on disk, refreshed 60s before expiry, full re-login
+// if the refresh grant fails. One in-flight mint at a time.
+let skylightMinting: Promise<SkylightToken> | null = null;
+
+function skylightConfigured(): boolean {
+  return !!(process.env.SKYLIGHT_EMAIL && process.env.SKYLIGHT_PASSWORD);
+}
+
+async function skylightMint(force: boolean): Promise<string> {
+  const cached = load<SkylightToken | null>("skylight-token", null);
+  if (!force && cached?.accessToken && (!cached.expiresAt || cached.expiresAt - 60_000 > Date.now())) return cached.accessToken;
+  skylightMinting ??= (async () => {
+    const email = process.env.SKYLIGHT_EMAIL, password = process.env.SKYLIGHT_PASSWORD;
+    if (!email || !password) throw new SkylightAuthError("SKYLIGHT_EMAIL / SKYLIGHT_PASSWORD not set");
+    let tok: SkylightToken | null = null;
+    if (cached?.refreshToken) {
+      tok = await skylightTokenRequest({ grant_type: "refresh_token", client_id: SKY.clientId, refresh_token: cached.refreshToken })
+        .catch((err) => { console.error(`[skylight] refresh failed (${err.message}); logging in again`); return null; });
+    }
+    tok ??= await skylightLogin(email, password);
+    save("skylight-token", tok);
+    return tok;
+  })().finally(() => { skylightMinting = null; });
+  return (await skylightMinting).accessToken;
+}
+
+// Authenticated JSON call. A 401/403 gets exactly one forced re-mint + retry.
+async function skylightApi(method: string, apiPath: string, body?: unknown): Promise<any> {
+  const send = async (token: string) =>
+    fetch(`${SKY.base}${apiPath}`, {
+      method,
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: "application/json",
+        "User-Agent": SKY.userAgent,
+        "Skylight-Api-Version": SKY.apiVersion,
+        ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
+      },
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+    });
+  let res = await send(await skylightMint(false));
+  if (res.status === 401 || res.status === 403) res = await send(await skylightMint(true));
+  if (res.status === 204 || res.status === 304) return null;
+  const data: any = await res.json().catch(() => null);
+  if (!res.ok) {
+    const errs = data?.errors;
+    const msg = Array.isArray(errs) ? errs.join("; ") : errs && typeof errs === "object"
+      ? Object.entries(errs).map(([k, v]) => `${k} ${([] as unknown[]).concat(v).join(", ")}`).join("; ")
+      : data?.error || res.statusText;
+    throw new Error(`Skylight ${method} ${apiPath} → HTTP ${res.status}: ${msg}`);
+  }
+  return data;
+}
+
+// Step-1 probe: prove auth works and show what's on the frame. Names/ids/counts
+// only — item contents stay out of logs.
+async function skylightProbe(): Promise<string> {
+  const out: string[] = [];
+  const frames = (await skylightApi("GET", "/api/frames"))?.data ?? [];
+  out.push(`Authenticated. ${frames.length} frame(s):`);
+  for (const f of frames) {
+    const a = f.attributes ?? {};
+    out.push(`\nFrame ${f.id} — "${a.name ?? "?"}" (household: ${a.household_name ?? "?"}, tz ${a.timezone ?? "?"}, plus: ${a.plus ?? "?"})`);
+    const lists = (await skylightApi("GET", `/api/frames/${f.id}/lists`))?.data ?? [];
+    out.push(`  Lists (${lists.length}):`);
+    for (const l of lists) {
+      const la = l.attributes ?? {};
+      const n = l.relationships?.list_items?.data?.length;
+      out.push(`    ${l.id}  "${la.label}"  kind=${la.kind}${la.default_grocery_list ? " (default grocery)" : ""}${n !== undefined ? `  ${n} item(s)` : ""}`);
+    }
+    const cats = (await skylightApi("GET", `/api/frames/${f.id}/categories`).catch((e) => ({ err: e.message })));
+    if (cats?.err) out.push(`  Family members: ${cats.err}`);
+    else out.push(`  Family members (categories): ${(cats?.data ?? []).map((c: any) => `${c.attributes?.label} [${c.id}]`).join(", ") || "none"}`);
+    const cals = (await skylightApi("GET", `/api/frames/${f.id}/source_calendars`).catch((e) => ({ err: e.message })));
+    if (cals?.err) out.push(`  Source calendars: ${cals.err}`);
+    else {
+      out.push(`  Source calendars (what the frame syncs from):`);
+      for (const c of cals?.data ?? []) {
+        const ca = c.attributes ?? {};
+        out.push(`    "${ca.label}"  kind=${ca.kind}  source_id=${ca.source_id}  editable=${ca.editable}${ca.default_for_new_events ? "  (default for new events)" : ""}`);
+      }
+    }
+  }
+  return out.join("\n");
+}
+
 async function serveMode(client: Anthropic, cfg: Config, port: number) {
   hydrateConfigFromEnv(cfg);
   let token = process.env.HOMEBASE_SERVER_TOKEN || cfg.serverToken;
@@ -3714,6 +3918,12 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
     setTimeout(tick, msUntil(timeStr, briefTz));
     console.log(`  ${label} scheduled daily at ${timeStr} ${briefTz}`);
   };
+  // Skylight: prove auth on boot and log what the frame has (step 1 of the sync).
+  if (skylightConfigured()) {
+    skylightProbe()
+      .then((r) => console.log(`[skylight] ${r}`))
+      .catch((err) => console.error(`[skylight] probe FAILED: ${err.message}`));
+  }
   // VIP email watcher — the one job on an interval rather than a daily clock.
   setInterval(() => checkVipEmails().catch(() => {}), 10 * 60 * 1000);
   console.log("  VIP email watcher running every 10 min");
@@ -3745,6 +3955,15 @@ async function main() {
 
   if (args.includes("--google-auth")) return googleConnect();
   if (args.includes("--setup-inbound")) return setupInboundAgent();
+  if (args.includes("--skylight")) {
+    try {
+      console.log(await skylightProbe());
+    } catch (err: any) {
+      console.error(`Skylight probe failed: ${err.message}`);
+      process.exitCode = 1;
+    }
+    return;
+  }
 
   const serve = args.includes("--serve");
   const cfg = await getConfig(!serve); // non-interactive in serve mode (no stdin on Railway)
