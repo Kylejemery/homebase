@@ -462,6 +462,28 @@ function mealViewerItems(node: any, out: string[] = []): string[] {
   return out;
 }
 
+const householdYmd = (d: Date) => new Intl.DateTimeFormat("en-CA", { timeZone: HOUSEHOLD_TZ() }).format(d);
+const toMdy = (ymd: string) => { const [y, m, d] = ymd.split("-"); return `${m}-${d}-${y}`; };
+
+// Lunch items per day for an inclusive YYYY-MM-DD range, in one MealViewer call.
+// Days with no lunch posted (weekends, holidays) are simply absent from the map.
+async function fetchSchoolLunches(school: string, fromYmd: string, toYmd: string): Promise<Record<string, string[]>> {
+  const res = await fetch(
+    `https://api.mealviewer.com/api/v4/school/${encodeURIComponent(school)}/${toMdy(fromYmd)}/${toMdy(toYmd)}/`
+  );
+  if (!res.ok) throw new Error(`MealViewer returned HTTP ${res.status} for ${school}`);
+  const data: any = await res.json();
+  const byDay: Record<string, string[]> = {};
+  for (const sched of data.menuSchedules ?? []) {
+    const lunch = (sched.menuBlocks ?? []).filter((b: any) => /lunch/i.test(b.blockName ?? ""));
+    const items = mealViewerItems(lunch);
+    // single-day requests may omit dateInformation; fall back to the requested day
+    const day = String(sched.dateInformation?.dateFull ?? lunch[0]?.scheduledDate ?? fromYmd).slice(0, 10);
+    if (items.length) byDay[day] = [...(byDay[day] ?? []), ...items.filter((i) => !byDay[day]?.includes(i))];
+  }
+  return byDay;
+}
+
 const schoolLunchTool: AgentTool = {
   schema: {
     name: "get_school_lunch",
@@ -479,19 +501,10 @@ const schoolLunchTool: AgentTool = {
   handler: async (input) => {
     const school = input.school_id || load<Config>("config", {}).schoolMenuId;
     if (!school) return "No school configured — set SCHOOL_MENU_ID (the id from schools.mealviewer.com/school/<id>).";
-    const ymd: string =
-      input.date ||
-      new Intl.DateTimeFormat("en-CA", { timeZone: HOUSEHOLD_TZ() }).format(new Date(Date.now() + 86_400_000));
+    const ymd: string = input.date || householdYmd(new Date(Date.now() + 86_400_000));
     if (!/^\d{4}-\d{2}-\d{2}$/.test(ymd)) return `Bad date '${ymd}' — use YYYY-MM-DD.`;
-    const [y, m, d] = ymd.split("-");
-    const mdy = `${m}-${d}-${y}`;
     try {
-      const res = await fetch(`https://api.mealviewer.com/api/v4/school/${encodeURIComponent(school)}/${mdy}/${mdy}/`);
-      if (!res.ok) return `MealViewer returned HTTP ${res.status} for ${school}.`;
-      const data: any = await res.json();
-      const blocks = (data.menuSchedules ?? []).flatMap((s: any) => s.menuBlocks ?? []);
-      const lunch = blocks.filter((b: any) => /lunch/i.test(b.blockName ?? ""));
-      const items = mealViewerItems(lunch);
+      const items = Object.values(await fetchSchoolLunches(school, ymd, ymd)).flat();
       if (!items.length) return `No lunch menu posted for ${school} on ${ymd} (weekend, holiday, or not published yet).`;
       return `${school} lunch on ${ymd}: ${items.join(", ")}`;
     } catch (e: any) {
@@ -3771,6 +3784,24 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
         const start = from ? new Date(`${from}T00:00:00`) : new Date();
         const sid = url.searchParams.get("sessionId") ?? undefined; // include this phone's private events
         return send(200, { events: await mergedCalendar(start, days, sid) });
+      }
+
+      // School lunch for one Mon–Fri week (app's side-menu lunch screen).
+      // week=0 is this school week — or next week on Sat/Sun; ±N pages from there.
+      if (req.method === "GET" && url.pathname === "/lunch") {
+        const school = load<Config>("config", {}).schoolMenuId;
+        if (!school) return send(200, { school: null, days: [] });
+        const offset = Math.max(-8, Math.min(8, Number(url.searchParams.get("week")) || 0));
+        const today = new Date(`${householdYmd(new Date())}T12:00:00Z`); // household date, noon UTC avoids DST edges
+        const dow = today.getUTCDay(); // 0 Sun … 6 Sat
+        const monday = new Date(today.getTime() + ((dow === 0 ? 1 : dow === 6 ? 2 : 1 - dow) + offset * 7) * 86_400_000);
+        const days = [0, 1, 2, 3, 4].map((i) => new Date(monday.getTime() + i * 86_400_000).toISOString().slice(0, 10));
+        try {
+          const byDay = await fetchSchoolLunches(school, days[0], days[4]);
+          return send(200, { school, days: days.map((date) => ({ date, items: byDay[date] ?? [] })) });
+        } catch (e: any) {
+          return send(502, { error: `Couldn't fetch the lunch menu: ${e.message}` });
+        }
       }
 
       // Add an event from the app's calendar form (Google when connected, else local).
