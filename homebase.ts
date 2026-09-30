@@ -92,6 +92,7 @@ interface Config {
   apiKey?: string;
   telegramBotToken?: string;
   homeCity?: string;
+  schoolMenuId?: string; // MealViewer school id, e.g. "HunterElementaryNC" (from schools.mealviewer.com/school/<id>)
   vapiApiKey?: string;
   vapiPhoneNumberId?: string;
   ownerName?: string;
@@ -444,6 +445,58 @@ const weatherTool: AgentTool = {
       `Today: high ${d.temperature_2m_max[0]}°F / low ${d.temperature_2m_min[0]}°F, ` +
       `${d.precipitation_probability_max[0]}% chance of precipitation.`
     );
+  },
+};
+
+// ── School lunch menu (MealViewer public API, no key) ───────────────────────
+
+// Recursively collect item names under a MealViewer block — tolerant of nesting
+// changes in their unofficial API (cafeteriaLineList.data[].foodItemList.data[]).
+function mealViewerItems(node: any, out: string[] = []): string[] {
+  if (Array.isArray(node)) node.forEach((n) => mealViewerItems(n, out));
+  else if (node && typeof node === "object") {
+    const name = node.item_Name ?? node.itemName;
+    if (typeof name === "string" && name.trim() && !out.includes(name.trim())) out.push(name.trim());
+    for (const v of Object.values(node)) if (v && typeof v === "object") mealViewerItems(v, out);
+  }
+  return out;
+}
+
+const schoolLunchTool: AgentTool = {
+  schema: {
+    name: "get_school_lunch",
+    description:
+      "The school cafeteria lunch menu for a given day (MealViewer). Defaults to TOMORROW in household time, " +
+      "so the family knows the night before whether to pack a lunch. Returns nothing-served on weekends/holidays.",
+    input_schema: {
+      type: "object",
+      properties: {
+        date: { type: "string", description: "YYYY-MM-DD (optional; default tomorrow)" },
+        school_id: { type: "string", description: "MealViewer school id (optional; defaults to configured school)" },
+      },
+    },
+  },
+  handler: async (input) => {
+    const school = input.school_id || load<Config>("config", {}).schoolMenuId;
+    if (!school) return "No school configured — set SCHOOL_MENU_ID (the id from schools.mealviewer.com/school/<id>).";
+    const ymd: string =
+      input.date ||
+      new Intl.DateTimeFormat("en-CA", { timeZone: HOUSEHOLD_TZ() }).format(new Date(Date.now() + 86_400_000));
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(ymd)) return `Bad date '${ymd}' — use YYYY-MM-DD.`;
+    const [y, m, d] = ymd.split("-");
+    const mdy = `${m}-${d}-${y}`;
+    try {
+      const res = await fetch(`https://api.mealviewer.com/api/v4/school/${encodeURIComponent(school)}/${mdy}/${mdy}/`);
+      if (!res.ok) return `MealViewer returned HTTP ${res.status} for ${school}.`;
+      const data: any = await res.json();
+      const blocks = (data.menuSchedules ?? []).flatMap((s: any) => s.menuBlocks ?? []);
+      const lunch = blocks.filter((b: any) => /lunch/i.test(b.blockName ?? ""));
+      const items = mealViewerItems(lunch);
+      if (!items.length) return `No lunch menu posted for ${school} on ${ymd} (weekend, holiday, or not published yet).`;
+      return `${school} lunch on ${ymd}: ${items.join(", ")}`;
+    } catch (e: any) {
+      return `Couldn't fetch the lunch menu: ${e.message}`;
+    }
   },
 };
 
@@ -1774,7 +1827,7 @@ async function setupInboundAgent() {
 const TOOLS: AgentTool[] = [
   listsTool, calendarTool, memoryTool, weatherTool, filesTool,
   gcalListTool, gcalAddTool, gcalUpdateTool, gmailTool, sendEmailTool, emailVipsTool, fetchWebTool, contactsTool, smsTool,
-  phoneCallTool, checkCallTool, commitmentsTool, familyTool, notifTool,
+  phoneCallTool, checkCallTool, commitmentsTool, familyTool, notifTool, schoolLunchTool,
 ];
 
 // ── MCP client — consume external MCP servers as extra agent tools ──────────
@@ -1846,7 +1899,7 @@ WHAT THE FAMILY CAN DO (answer "what can you do" questions from this, and guide 
   render a button to open it with this EXACT syntax: {{open:comms|View communication log}} (the app makes it tappable).
 DAILY RHYTHM (${tz}): restock check 05:30 → morning briefing ${cfg.briefingTime ?? "07:00"} (calendar,
 weather, important emails, commitments, restocked staples) → afternoon debrief ${cfg.debriefTime ?? "16:30"}
-(today's recap + tomorrow) → evening nudge ${cfg.nudgeTime ?? "20:00"} (only when something warrants it:
+(today's recap + tomorrow + tomorrow's school lunch) → evening nudge ${cfg.nudgeTime ?? "20:00"} (only when something warrants it:
 early events, conflicts, emails with dates not on the calendar) → habit reflection ${cfg.reflectionTime ?? "21:30"}
 (silent). All delivered as push notifications and shown in the app's chat feed.
 
@@ -2045,6 +2098,9 @@ const AFTERNOON_DEBRIEF_TASK = (cfg: Config) =>
 2. Tomorrow's appointments — list them so the family can prepare tonight.
 3. Important emails from today if Gmail is connected (gmail_summary, last ~10 hours); only ones needing action. Omit silently if not connected.
 4. Open list items that still need attention.
+5. Tomorrow's school lunch — call get_school_lunch (no date = tomorrow) and list the menu in one line
+   so the family can decide tonight whether to pack a lunch. If it says no school is configured or
+   no menu is posted, omit this section silently.
 Check family_memory for 'habit' entries and tailor accordingly.
 Keep it brief and warm — this is the "how'd today go, what's tomorrow" message.`;
 
@@ -2266,6 +2322,7 @@ function hydrateConfigFromEnv(cfg: Config) {
     ["ownerName", process.env.OWNER_NAME],
     ["ownerCallback", process.env.OWNER_CALLBACK],
     ["homeCity", process.env.HOME_CITY],
+    ["schoolMenuId", process.env.SCHOOL_MENU_ID],
     ["googleClientId", process.env.GOOGLE_CLIENT_ID],
     ["googleClientSecret", process.env.GOOGLE_CLIENT_SECRET],
     ["telegramBotToken", process.env.TELEGRAM_BOT_TOKEN],
