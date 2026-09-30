@@ -25,6 +25,7 @@ server. This deploys `homebase --serve` to Railway.
    | `OWNER_NAME` | (optional) e.g. `Kyle` |
    | `OWNER_CALLBACK` | (optional) e.g. `+16175295115` |
    | `HOME_CITY` | (optional) e.g. `Raleigh` for weather |
+| `SCHOOL_MENU_ID` | (optional) MealViewer school id, e.g. `HunterElementaryNC` — adds tomorrow's school lunch to the afternoon debrief |
    | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | (optional) for Calendar |
    | `GOOGLE_TOKENS` | (optional) the JSON blob from a local `--google-auth` run — see below |
 
