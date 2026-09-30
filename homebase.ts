@@ -3245,7 +3245,8 @@ async function skylightLogin(email: string, password: string): Promise<SkylightT
         const i = pair.indexOf("=");
         if (i > 0) jar.set(pair.slice(0, i).trim(), pair.slice(i + 1).trim());
       }
-      if (![301, 302, 303, 307, 308].includes(res.status)) return { page: await res.text(), code: null as string | null };
+      if (![301, 302, 303, 307, 308].includes(res.status))
+        return { page: await res.text(), code: null as string | null, status: res.status, at: new URL(url).pathname };
       const loc = res.headers.get("location");
       if (!loc) throw new SkylightAuthError(`HTTP ${res.status} redirect without a Location`);
       const target = new URL(loc, url).toString();
@@ -3255,7 +3256,7 @@ async function skylightLogin(email: string, password: string): Promise<SkylightT
         if (q.get("state") !== state) throw new SkylightAuthError("OAuth state mismatch; aborting login");
         const code = q.get("code");
         if (!code) throw new SkylightAuthError("redirect carried no authorization code");
-        return { page: null, code };
+        return { page: null, code, status: res.status, at: new URL(url).pathname };
       }
       url = target;
       form = undefined;
@@ -3270,14 +3271,25 @@ async function skylightLogin(email: string, password: string): Promise<SkylightT
     state, code_challenge: challenge, code_challenge_method: "S256",
   })) authorize.searchParams.set(k, v);
 
-  let { page, code } = await follow("GET", authorize.toString());
+  let { page, code, status, at } = await follow("GET", authorize.toString());
   if (!code) {
     const csrf = page?.match(/<meta[^>]+name=["']csrf-token["'][^>]+content=["']([^"']+)["']/i)?.[1];
     if (!csrf) throw new SkylightAuthError("could not find a CSRF token on the login page");
     const unescaped = csrf.replace(/&amp;/g, "&").replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">");
-    ({ code } = await follow("POST", `${SKY.base}/auth/session`, { authenticity_token: unescaped, email, password }));
+    ({ page, code, status, at } = await follow("POST", `${SKY.base}/auth/session`, { authenticity_token: unescaped, email, password }));
   }
-  if (!code) throw new SkylightAuthError("login did not yield an authorization code; check SKYLIGHT_EMAIL / SKYLIGHT_PASSWORD");
+  if (!code) {
+    // Say where the flow stopped and what the page said — never the credentials.
+    const text = (page ?? "")
+      .replace(/<(script|style)[\s\S]*?<\/\1>/gi, " ")
+      .match(/class=["'][^"']*(?:alert|flash|error|notice)[^"']*["'][^>]*>([\s\S]*?)<\//i)?.[1]
+      ?.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim().slice(0, 200);
+    const title = page?.match(/<title>([\s\S]*?)<\/title>/i)?.[1]?.trim().slice(0, 80);
+    throw new SkylightAuthError(
+      `login did not yield an authorization code (stopped at ${at}, HTTP ${status}` +
+        `${title ? `, page "${title}"` : ""}${text ? `, message "${text}"` : ""}); check SKYLIGHT_EMAIL / SKYLIGHT_PASSWORD`,
+    );
+  }
 
   return skylightTokenRequest({
     grant_type: "authorization_code", client_id: SKY.clientId, code, redirect_uri: SKY.redirectUri, code_verifier: verifier,
