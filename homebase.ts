@@ -39,7 +39,7 @@ const TURN_CTX = new AsyncLocalStorage<{ sessionId?: string }>();
 // Set once in main(); lets tool handlers (e.g. fetch_webpage's PDF reader) make
 // their own model calls without threading the client through every signature.
 let ANTHROPIC: Anthropic | null = null;
-import { randomUUID, createHmac, randomBytes, createHash } from "crypto";
+import { randomUUID, createHmac, randomBytes, createHash, timingSafeEqual } from "crypto";
 
 // Keep in sync with package.json
 const VERSION = "0.1.0";
@@ -2153,15 +2153,15 @@ type NotifJob = "briefing" | "debrief" | "nudge";
 const jobEnabled = (sid: string, job: NotifJob) =>
   load<Record<string, Partial<Record<NotifJob, boolean>>>>("notif-prefs", {})[sid]?.[job] !== false;
 const eligibleSessions = (job: NotifJob) =>
-  Object.keys(load<Record<string, string>>("push", {})).filter((sid) => jobEnabled(sid, job));
+  Object.keys(load<PushRegistry>("push", {})).filter((sid) => jobEnabled(sid, job));
 
 // Deliver a message to registered phones. Expo's push API needs no key for
 // sends. `onlySessionId` targets one phone; `job` targets everyone who hasn't
 // muted that scheduled job; neither = every registered phone.
 async function sendExpoPush(title: string, body: string, onlySessionId?: string, job?: NotifJob): Promise<string> {
-  const registry = load<Record<string, string>>("push", {});
+  const registry = load<PushRegistry>("push", {});
   const sids = onlySessionId ? [onlySessionId] : job ? eligibleSessions(job) : Object.keys(registry);
-  const tokens = sids.map((s) => registry[s]).filter(Boolean);
+  const tokens = sids.flatMap((s) => pushTokensOf(registry[s]));
   if (!tokens.length) return "No registered push tokens.";
   const messages = tokens.map((to) => ({ to, title, body, sound: "default" }));
   const res = await fetch("https://exp.host/--/api/v2/push/send", {
@@ -2579,7 +2579,7 @@ interface TipState {
 async function runCapabilityTips(force = false): Promise<string> {
   const cfg = load<Config>("config", {});
   const everyDays = cfg.tipEveryDays ?? 7;
-  const pushReg = load<Record<string, string>>("push", {});
+  const pushReg = load<PushRegistry>("push", {});
   const usage = load<Usage>("usage", {});
   const tips = load<Record<string, TipState>>("tips", {});
   const now = Date.now();
@@ -2682,7 +2682,7 @@ async function fetchInboxRows(token: string, hours: number): Promise<string[]> {
 // feed as a personal item, invisible to the rest of the household.
 async function deliverPersonalEmailDigests(client: Anthropic, kind: "morning" | "debrief"): Promise<number> {
   const users = load<Record<string, GTokens>>("google-users", {});
-  const pushReg = load<Record<string, string>>("push", {});
+  const pushReg = load<PushRegistry>("push", {});
   let delivered = 0;
   for (const sessionId of Object.keys(users)) {
     if (!pushReg[sessionId]) continue;
@@ -3395,6 +3395,298 @@ async function skylightProbe(): Promise<string> {
   return out.join("\n");
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Household accounts — Supabase Auth behind the brain's /auth/* routes
+// ═══════════════════════════════════════════════════════════════════════════
+// The app (1.1.0+) signs in with a username or email and a password. Supabase
+// holds the emails and password hashes; public.profiles (homebase-app repo,
+// supabase/migrations/) maps each user to a username and the brain session id
+// that keys their chat history and private items. Sign-up needs the household
+// invite code. The contract is homebase-app/docs/brain-auth.md.
+//
+// Env: SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SERVICE_ROLE_KEY,
+// HOMEBASE_INVITE_CODE, and for the username reminder email RESEND_API_KEY +
+// HOMEBASE_EMAIL_FROM. Unset → accounts are off and only the shared server
+// token works, as before.
+
+interface Account {
+  id: string;
+  email: string;
+  username: string;
+  sessionId: string;
+}
+
+interface AuthSession {
+  accessToken: string;
+  refreshToken: string;
+  expiresAt: number; // unix seconds
+  user: Account;
+}
+
+class AuthError extends Error {
+  constructor(public status: number, message: string) {
+    super(message);
+  }
+}
+
+const USERNAME_RE = /^[A-Za-z0-9_.]{3,30}$/;
+const LEGACY_SID_RE = /^phone-[a-z0-9]{8}$/;
+const MIN_PASSWORD = 8;
+
+function supabaseEnv() {
+  const url = process.env.SUPABASE_URL?.trim().replace(/\/+$/, "");
+  const anon = process.env.SUPABASE_ANON_KEY?.trim();
+  const service = process.env.SUPABASE_SERVICE_ROLE_KEY?.trim();
+  return url && anon && service ? { url, anon, service } : null;
+}
+
+// One call to Supabase (auth/v1 or rest/v1). `as` picks which key signs it;
+// `token` overrides the bearer with a user's access token.
+async function supabase(
+  path: string,
+  opts: { method?: string; body?: unknown; as?: "anon" | "service"; token?: string; headers?: Record<string, string> } = {},
+): Promise<{ ok: boolean; status: number; data: any }> {
+  const env = supabaseEnv();
+  if (!env) throw new AuthError(503, "Accounts aren't set up on this Homebase yet.");
+  const key = opts.as === "service" ? env.service : env.anon;
+  const res = await fetch(`${env.url}${path}`, {
+    method: opts.method ?? (opts.body === undefined ? "GET" : "POST"),
+    headers: {
+      apikey: key,
+      Authorization: `Bearer ${opts.token ?? key}`,
+      "Content-Type": "application/json",
+      ...opts.headers,
+    },
+    body: opts.body === undefined ? undefined : JSON.stringify(opts.body),
+  });
+  const text = await res.text();
+  let data: any = {};
+  try {
+    data = text ? JSON.parse(text) : {};
+  } catch {}
+  return { ok: res.ok, status: res.status, data };
+}
+
+async function rpc<T>(fn: string, args: Record<string, unknown>): Promise<T | null> {
+  const r = await supabase(`/rest/v1/rpc/${fn}`, { body: args, as: "service" });
+  if (!r.ok) throw new Error(`${fn} failed (${r.status})`);
+  return (r.data ?? null) as T | null;
+}
+
+async function profileFor(userId: string): Promise<{ username: string; session_id: string } | null> {
+  const r = await supabase(`/rest/v1/profiles?id=eq.${encodeURIComponent(userId)}&select=username,session_id`, { as: "service" });
+  if (!r.ok) throw new Error(`profile lookup failed (${r.status})`);
+  return Array.isArray(r.data) && r.data[0] ? r.data[0] : null;
+}
+
+// "@" means an email; anything else is a username.
+async function emailFor(identifier: string): Promise<string | null> {
+  const id = identifier.trim();
+  if (!id) return null;
+  if (id.includes("@")) return id.toLowerCase();
+  return rpc<string>("email_for_username", { p_username: id });
+}
+
+// Supabase token response → the app's session shape.
+async function toSession(t: any): Promise<AuthSession> {
+  const prof = await profileFor(t.user?.id);
+  if (!prof) throw new AuthError(403, "This login isn't set up for Homebase.");
+  return {
+    accessToken: t.access_token,
+    refreshToken: t.refresh_token,
+    expiresAt: t.expires_at ?? Math.floor(Date.now() / 1000) + (t.expires_in ?? 3600),
+    user: { id: t.user.id, email: t.user.email, username: prof.username, sessionId: prof.session_id },
+  };
+}
+
+async function passwordGrant(email: string, password: string): Promise<any> {
+  const r = await supabase("/auth/v1/token?grant_type=password", { body: { email, password } });
+  if (!r.ok) throw new AuthError(401, "Wrong username/email or password.");
+  return r.data;
+}
+
+function checkNewPassword(password: unknown): string {
+  if (typeof password !== "string" || password.length < MIN_PASSWORD)
+    throw new AuthError(400, `Password must be at least ${MIN_PASSWORD} characters.`);
+  return password;
+}
+
+function inviteMatches(code: unknown): boolean {
+  const want = process.env.HOMEBASE_INVITE_CODE?.trim();
+  if (!want || typeof code !== "string") return false;
+  const h = (s: string) => createHash("sha256").update(s.trim().toLowerCase()).digest();
+  return timingSafeEqual(h(code), h(want));
+}
+
+async function signUpAccount(b: any): Promise<AuthSession> {
+  if (!process.env.HOMEBASE_INVITE_CODE?.trim()) throw new AuthError(503, "Sign-up isn't open on this Homebase.");
+  if (!inviteMatches(b.inviteCode)) throw new AuthError(403, "That invite code isn't right.");
+  const username = String(b.username ?? "").trim();
+  if (!USERNAME_RE.test(username))
+    throw new AuthError(400, "Username must be 3–30 letters, numbers, dots or underscores.");
+  const email = String(b.email ?? "").trim().toLowerCase();
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw new AuthError(400, "Enter a valid email address.");
+  const password = checkNewPassword(b.password);
+  if (await rpc<string>("email_for_username", { p_username: username }))
+    throw new AuthError(409, "That username is taken.");
+
+  const created = await supabase("/auth/v1/admin/users", {
+    as: "service",
+    body: { email, password, email_confirm: true, user_metadata: { username } },
+  });
+  if (!created.ok) {
+    const msg = String(created.data?.msg ?? created.data?.message ?? created.data?.error_description ?? "");
+    if (created.status === 422 && /already/i.test(msg))
+      throw new AuthError(409, "That email already has an account. Sign in, or reset your password.");
+    if (/password/i.test(msg)) throw new AuthError(400, msg);
+    throw new Error(`create user failed (${created.status})`);
+  }
+  const userId: string = created.data.id;
+
+  // Adopt the phone's pre-accounts id when it's free, so its history carries over.
+  const candidates = [
+    ...(typeof b.legacySessionId === "string" && LEGACY_SID_RE.test(b.legacySessionId) ? [b.legacySessionId] : []),
+    `user-${userId}`,
+  ];
+  let inserted = false;
+  for (const session_id of candidates) {
+    const r = await supabase("/rest/v1/profiles", {
+      as: "service",
+      body: { id: userId, username, session_id },
+      headers: { Prefer: "return=minimal" },
+    });
+    if (r.ok) {
+      inserted = true;
+      break;
+    }
+    if (r.status === 409 && /username/.test(JSON.stringify(r.data))) break; // lost a race for the name
+    if (r.status !== 409) break;
+  }
+  if (!inserted) {
+    await supabase(`/auth/v1/admin/users/${userId}`, { method: "DELETE", as: "service" });
+    throw new AuthError(409, "That username is taken.");
+  }
+  return toSession(await passwordGrant(email, password));
+}
+
+async function signInAccount(b: any): Promise<AuthSession> {
+  const email = await emailFor(String(b.identifier ?? ""));
+  if (!email || typeof b.password !== "string") throw new AuthError(401, "Wrong username/email or password.");
+  return toSession(await passwordGrant(email, b.password));
+}
+
+async function refreshAccount(b: any): Promise<AuthSession> {
+  if (typeof b.refreshToken !== "string") throw new AuthError(400, "refreshToken required");
+  const r = await supabase("/auth/v1/token?grant_type=refresh_token", { body: { refresh_token: b.refreshToken } });
+  if (!r.ok) throw new AuthError(401, "Your session expired. Please sign in again.");
+  return toSession(r.data);
+}
+
+// Emails a 6-digit code (the Reset Password template must use {{ .Token }}).
+// Always "ok" so this can't be used to find out which accounts exist.
+async function requestReset(b: any): Promise<void> {
+  const email = await emailFor(String(b.identifier ?? ""));
+  if (!email) return;
+  const r = await supabase("/auth/v1/recover", { body: { email } });
+  if (!r.ok) console.error(`[auth] recover failed (${r.status})`);
+}
+
+async function resetWithCode(b: any): Promise<AuthSession> {
+  const password = checkNewPassword(b.password);
+  const email = await emailFor(String(b.identifier ?? ""));
+  const code = String(b.code ?? "").trim();
+  if (!email || !/^\d{6}$/.test(code)) throw new AuthError(400, "That code is wrong or expired.");
+  const v = await supabase("/auth/v1/verify", { body: { type: "recovery", email, token: code } });
+  if (!v.ok || !v.data?.access_token) throw new AuthError(400, "That code is wrong or expired.");
+  const u = await supabase("/auth/v1/user", { method: "PUT", body: { password }, token: v.data.access_token });
+  if (!u.ok) {
+    const msg = String(u.data?.msg ?? u.data?.message ?? "");
+    throw new AuthError(400, msg || "Couldn't set that password. Try another.");
+  }
+  return toSession(v.data);
+}
+
+// Always "ok", for the same reason as requestReset.
+async function remindUsername(b: any): Promise<void> {
+  const email = String(b.email ?? "").trim().toLowerCase();
+  if (!email.includes("@")) return;
+  const username = await rpc<string>("username_for_email", { p_email: email });
+  if (!username) return;
+  const key = process.env.RESEND_API_KEY?.trim();
+  const from = process.env.HOMEBASE_EMAIL_FROM?.trim();
+  if (!key || !from) {
+    console.error("[auth] username reminder not sent: RESEND_API_KEY / HOMEBASE_EMAIL_FROM unset");
+    return;
+  }
+  const r = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      from,
+      to: email,
+      subject: "Your Homebase username",
+      text: `Your Homebase username is: ${username}\n\nYou can also sign in with this email address.\n\nIf you didn't ask for this, you can ignore this email.`,
+    }),
+  });
+  if (!r.ok) console.error(`[auth] username reminder failed (${r.status})`);
+}
+
+// Bearer → account. Supabase validates the token; results are cached until
+// the token expires (at most 5 minutes) so data calls don't each round-trip.
+const accountCache = new Map<string, { account: Account; until: number }>();
+async function accountForToken(token: string): Promise<Account | null> {
+  if (!token || !supabaseEnv()) return null;
+  const hit = accountCache.get(token);
+  if (hit && hit.until > Date.now()) return hit.account;
+  const r = await supabase("/auth/v1/user", { token });
+  if (!r.ok || !r.data?.id) return null;
+  const prof = await profileFor(r.data.id);
+  if (!prof) return null;
+  const account = { id: r.data.id, email: r.data.email, username: prof.username, sessionId: prof.session_id };
+  let exp = Date.now() + 300_000;
+  try {
+    const claims = JSON.parse(Buffer.from(token.split(".")[1], "base64url").toString());
+    if (claims.exp) exp = Math.min(exp, claims.exp * 1000);
+  } catch {}
+  if (accountCache.size > 500) accountCache.clear();
+  accountCache.set(token, { account, until: exp });
+  return account;
+}
+
+// Unauthenticated /auth routes get 10 tries a minute per IP.
+const authHits = new Map<string, { n: number; reset: number }>();
+function authRateLimited(req: http.IncomingMessage, route: string): boolean {
+  const ip = String(req.headers["x-forwarded-for"] ?? req.socket.remoteAddress ?? "").split(",")[0].trim();
+  const k = `${ip} ${route}`;
+  const now = Date.now();
+  const e = authHits.get(k);
+  if (!e || e.reset < now) {
+    if (authHits.size > 5000) authHits.clear();
+    authHits.set(k, { n: 1, reset: now + 60_000 });
+    return false;
+  }
+  return ++e.n > 10;
+}
+
+// Everything the brain keeps under a session id, removed when its account is
+// deleted. Shared household data (lists, calendar, family memory) stays.
+function purgeSessionData(sid: string) {
+  for (const name of ["push", "google-users", "email-vips", "notif-prefs", "usage", "tips", "vip-last-check", "feed-read", "sessions"]) {
+    const m = load<Record<string, unknown>>(name, {});
+    if (sid in m) {
+      delete m[sid];
+      save(name, m);
+    }
+  }
+  save("feed", load<FeedItem[]>("feed", []).filter((f) => f.sessionId !== sid));
+  save("comms", load<CommEntry[]>("comms", []).filter((c) => c.sessionId !== sid));
+  save("chat-log", load<ChatLogEntry[]>("chat-log", []).filter((e) => e.sid !== sid));
+}
+
+// Push registry: session id → that account's phones (older entries hold one token).
+type PushRegistry = Record<string, string | string[]>;
+const pushTokensOf = (v: string | string[] | undefined): string[] => (Array.isArray(v) ? v : v ? [v] : []);
+
 async function serveMode(client: Anthropic, cfg: Config, port: number) {
   hydrateConfigFromEnv(cfg);
   let token = process.env.HOMEBASE_SERVER_TOKEN || cfg.serverToken;
@@ -3577,11 +3869,78 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
         return send(404, { error: "not found" });
       }
 
-      if ((req.headers.authorization ?? "") !== `Bearer ${token}`) return send(401, { error: "unauthorized" });
+      // ── Household accounts (see docs in the accounts section above) ──
+      if (req.method === "POST" && url.pathname.startsWith("/auth/") && !["/auth/logout", "/auth/delete-account"].includes(url.pathname)) {
+        if (authRateLimited(req, url.pathname)) return send(429, { error: "Too many tries. Wait a minute and try again." });
+        const b = JSON.parse((await readBody(req)) || "{}");
+        try {
+          switch (url.pathname) {
+            case "/auth/signup": return send(200, await signUpAccount(b));
+            case "/auth/login": return send(200, await signInAccount(b));
+            case "/auth/refresh": return send(200, await refreshAccount(b));
+            case "/auth/forgot-password": await requestReset(b); return send(200, { ok: true });
+            case "/auth/reset-password": return send(200, await resetWithCode(b));
+            case "/auth/forgot-username": await remindUsername(b); return send(200, { ok: true });
+          }
+          return send(404, { error: "not found" });
+        } catch (err: any) {
+          if (err instanceof AuthError) return send(err.status, { error: err.message });
+          console.error(`[auth] ${url.pathname}: ${err.message}`);
+          return send(500, { error: "Something went wrong. Try again in a minute." });
+        }
+      }
+
+      // Bearer is either the shared server token (1.0.0 app builds, fridge
+      // setup, scripts) or a signed-in account's access token. For accounts the
+      // session id always comes from the account, whatever the client sends —
+      // otherwise one person could read another's private items.
+      const bearer = (req.headers.authorization ?? "").replace(/^Bearer\s+/i, "");
+      const acct = bearer && bearer === token ? null : await accountForToken(bearer);
+      if (bearer !== token && !acct) return send(401, { error: "unauthorized" });
+      if (acct) url.searchParams.set("sessionId", acct.sessionId);
+      let rawBody: string | undefined;
+      const jsonBody = async (): Promise<any> => {
+        rawBody ??= await readBody(req);
+        const b = JSON.parse(rawBody || "{}");
+        if (acct && b && typeof b === "object") b.sessionId = acct.sessionId;
+        return b;
+      };
+
+      if (req.method === "POST" && url.pathname === "/auth/logout") {
+        if (!acct) return send(400, { error: "not signed in" });
+        const { pushToken } = await jsonBody();
+        if (pushToken) {
+          const reg = load<PushRegistry>("push", {});
+          const left = pushTokensOf(reg[acct.sessionId]).filter((t) => t !== pushToken);
+          if (left.length) reg[acct.sessionId] = left;
+          else delete reg[acct.sessionId];
+          save("push", reg);
+        }
+        await supabase("/auth/v1/logout?scope=local", { body: {}, token: bearer }).catch(() => {});
+        accountCache.delete(bearer);
+        return send(200, { ok: true });
+      }
+
+      if (req.method === "POST" && url.pathname === "/auth/delete-account") {
+        if (!acct) return send(400, { error: "not signed in" });
+        const { password } = await jsonBody();
+        try {
+          await passwordGrant(acct.email, String(password ?? ""));
+        } catch {
+          return send(401, { error: "That password isn't right." });
+        }
+        const del = await supabase(`/auth/v1/admin/users/${acct.id}`, { method: "DELETE", as: "service" });
+        if (!del.ok) return send(500, { error: "Couldn't delete the account. Try again in a minute." });
+        purgeSessionData(acct.sessionId);
+        sessions.delete(acct.sessionId);
+        pendingNotes.delete(acct.sessionId);
+        for (const [k, v] of accountCache) if (v.account.id === acct.id) accountCache.delete(k);
+        return send(200, { ok: true });
+      }
 
       // Mint a personal-email connect URL for this phone (10-min single-use state).
       if (req.method === "POST" && url.pathname === "/oauth/google/init") {
-        const { sessionId } = JSON.parse((await readBody(req)) || "{}");
+        const { sessionId } = (await jsonBody());
         if (!sessionId) return send(400, { error: "sessionId required" });
         const cfg = load<Config>("config", {});
         if (!cfg.googleWebClientId || !cfg.googleWebClientSecret || !cfg.publicUrl)
@@ -3606,7 +3965,7 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
       }
 
       if (req.method === "POST" && url.pathname === "/chat") {
-        const { sessionId = "default", message } = JSON.parse((await readBody(req)) || "{}");
+        const { sessionId = "default", message } = (await jsonBody());
         if (!message || typeof message !== "string") return send(400, { error: "message (string) required" });
         logChat(sessionId, message);
         const history = sessions.get(sessionId) ?? [];
@@ -3654,7 +4013,7 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
       // Manual "run it now" — also how delivery gets tested end to end.
       // Body: { kind?: "morning" | "debrief" | "nudge" | "reflection" }
       if (req.method === "POST" && url.pathname === "/briefing") {
-        const { kind = "morning" } = JSON.parse((await readBody(req)) || "{}");
+        const { kind = "morning" } = (await jsonBody());
         if (kind === "reflection") return send(200, { report: await runNightlyReflection(client) });
         if (kind === "nudge") return send(200, { report: await runNudgeAndDeliver(client) });
         return send(200, { report: await runBriefingAndDeliver(client, kind === "debrief" ? "debrief" : "morning") });
@@ -3663,15 +4022,16 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
       // Run the "Did you know?" capability tips now. { force: true } skips the
       // per-phone time gate (testing); the unused/already-sent rules still apply.
       if (req.method === "POST" && url.pathname === "/tips") {
-        const { force } = JSON.parse((await readBody(req)) || "{}");
+        const { force } = (await jsonBody());
         return send(200, { report: await runCapabilityTips(!!force) });
       }
 
       if (req.method === "POST" && url.pathname === "/register-push") {
-        const { sessionId = "default", pushToken } = JSON.parse((await readBody(req)) || "{}");
+        const { sessionId = "default", pushToken } = (await jsonBody());
         if (!pushToken) return send(400, { error: "pushToken required" });
-        const tokens = load<Record<string, string>>("push", {});
-        tokens[sessionId] = pushToken;
+        // An account can be signed in on several phones; keep each one's token.
+        const tokens = load<PushRegistry>("push", {});
+        tokens[sessionId] = [...pushTokensOf(tokens[sessionId]).filter((t) => t !== pushToken), pushToken].slice(-5);
         save("push", tokens);
         return send(200, { ok: true });
       }
@@ -3682,7 +4042,7 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
         return send(200, {
           dataDir: DIR,
           homebaseDirEnv: process.env.HOMEBASE_DIR ?? null,
-          pushTokens: Object.keys(load<Record<string, string>>("push", {})).length,
+          pushTokens: Object.keys(load<PushRegistry>("push", {})).length,
           sessions: Object.keys(load<StoredSessions>("sessions", {})).length,
           listItems: Object.values(load<Lists>("lists", {})).reduce((n, l) => n + l.length, 0),
           displayUrl: cfgNow.publicUrl && cfgNow.displayToken ? `${cfgNow.publicUrl}/display?key=${cfgNow.displayToken}` : null,
@@ -3698,7 +4058,7 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
 
       // Check off a family alert — household-wide (handled is handled for everyone).
       if (req.method === "POST" && url.pathname === "/feed/dismiss") {
-        const { at } = JSON.parse((await readBody(req)) || "{}");
+        const { at } = (await jsonBody());
         const feed = load<FeedItem[]>("feed", []);
         const item = feed.find((f) => f.at === at);
         if (!item) return send(404, { error: "no such alert" });
@@ -3727,14 +4087,14 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
       }
 
       if (req.method === "POST" && url.pathname === "/lists/add") {
-        const { list = "grocery", item } = JSON.parse((await readBody(req)) || "{}");
+        const { list = "grocery", item } = (await jsonBody());
         if (!item || typeof item !== "string") return send(400, { error: "item (string) required" });
         addToList(String(list).toLowerCase(), [item.trim()]);
         return send(200, { lists: load<Lists>("lists", {}) });
       }
 
       if (req.method === "POST" && url.pathname === "/lists/toggle") {
-        const { list, id } = JSON.parse((await readBody(req)) || "{}");
+        const { list, id } = (await jsonBody());
         const lists = load<Lists>("lists", {});
         const it = lists[String(list).toLowerCase()]?.find((i) => i.id === Number(id));
         if (!it) return send(404, { error: `no #${id} in ${list}` });
@@ -3745,7 +4105,7 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
       }
 
       if (req.method === "POST" && url.pathname === "/lists/clear_done") {
-        const { list = "grocery" } = JSON.parse((await readBody(req)) || "{}");
+        const { list = "grocery" } = (await jsonBody());
         const lists = load<Lists>("lists", {});
         const name = String(list).toLowerCase();
         if (lists[name]) {
@@ -3756,7 +4116,7 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
       }
 
       if (req.method === "POST" && url.pathname === "/lists/remove") {
-        const { list, id } = JSON.parse((await readBody(req)) || "{}");
+        const { list, id } = (await jsonBody());
         const lists = load<Lists>("lists", {});
         const arr = lists[String(list).toLowerCase()] ?? [];
         const idx = arr.findIndex((i) => i.id === Number(id));
@@ -3767,13 +4127,13 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
       }
 
       if (req.method === "POST" && url.pathname === "/lists/rename") {
-        const { list, name } = JSON.parse((await readBody(req)) || "{}");
+        const { list, name } = (await jsonBody());
         const r = renameList(String(list ?? "").toLowerCase(), String(name ?? ""));
         return send(r.ok ? 200 : 400, r.ok ? { lists: load<Lists>("lists", {}) } : { error: r.message });
       }
 
       if (req.method === "POST" && url.pathname === "/lists/delete") {
-        const { list } = JSON.parse((await readBody(req)) || "{}");
+        const { list } = (await jsonBody());
         const r = deleteList(String(list ?? "").toLowerCase());
         return send(r.ok ? 200 : 400, r.ok ? { lists: load<Lists>("lists", {}) } : { error: r.message });
       }
@@ -3806,7 +4166,7 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
 
       // Add an event from the app's calendar form (Google when connected, else local).
       if (req.method === "POST" && url.pathname === "/calendar/add") {
-        const { title, start, end, who, notes, allDay, private: priv, sessionId } = JSON.parse((await readBody(req)) || "{}");
+        const { title, start, end, who, notes, allDay, private: priv, sessionId } = (await jsonBody());
         if (!title || !start) return send(400, { error: "title and start required" });
         const gtoken = await googleAccessToken();
         if (gtoken) {
@@ -3889,7 +4249,7 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
 
       // Edit an event on either calendar. Google edits sync to the real calendar.
       if (req.method === "POST" && url.pathname === "/calendar/update") {
-        const { source, id, title, start, end, notes, who, private: priv, sessionId } = JSON.parse((await readBody(req)) || "{}");
+        const { source, id, title, start, end, notes, who, private: priv, sessionId } = (await jsonBody());
         if (!id || !source) return send(400, { error: "source and id required" });
         if (source === "local") {
           const events = load<CalEvent[]>("calendar", []);
@@ -3934,7 +4294,7 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
       }
 
       if (req.method === "POST" && url.pathname === "/calendar/delete") {
-        const { source, id } = JSON.parse((await readBody(req)) || "{}");
+        const { source, id } = (await jsonBody());
         if (!id || !source) return send(400, { error: "source and id required" });
         if (source === "local") {
           const events = load<CalEvent[]>("calendar", []);
@@ -3957,7 +4317,7 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
 
       // Recipe import: { url } or { image (base64), mediaType } → grocery list.
       if (req.method === "POST" && url.pathname === "/recipe") {
-        const body = JSON.parse((await readBody(req)) || "{}");
+        const body = (await jsonBody());
         if (!body.url && !body.image) return send(400, { error: "url or image required" });
         const ingredients = await extractIngredients(client, body);
         if (!ingredients.length) return send(200, { added: [], message: "No ingredients found — is that a recipe?" });
@@ -3968,7 +4328,7 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
 
       // List scan: photo of a printed list → items into a named list.
       if (req.method === "POST" && url.pathname === "/list-scan") {
-        const body = JSON.parse((await readBody(req)) || "{}");
+        const body = (await jsonBody());
         if (!body.image) return send(400, { error: "image required" });
         const items = await extractListItems(client, body);
         if (!items.length) return send(200, { added: [], message: "Couldn't find list items in that photo." });
@@ -3979,7 +4339,7 @@ async function serveMode(client: Anthropic, cfg: Config, port: number) {
 
       // Document scan: { image (base64), mediaType, hint? } → facts into family_memory.
       if (req.method === "POST" && url.pathname === "/document") {
-        const body = JSON.parse((await readBody(req)) || "{}");
+        const body = (await jsonBody());
         if (!body.image) return send(400, { error: "image required" });
         const { summary, facts } = await extractDocumentFacts(client, body);
         if (!facts.length) return send(200, { summary, stored: [], message: "Couldn't read anything durable from that photo." });

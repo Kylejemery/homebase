@@ -28,11 +28,34 @@ server. This deploys `homebase --serve` to Railway.
    | `SCHOOL_MENU_ID` | (optional) MealViewer school id, e.g. `HunterElementaryNC` — adds tomorrow's school lunch to the afternoon debrief |
    | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | (optional) for Calendar |
    | `GOOGLE_TOKENS` | (optional) the JSON blob from a local `--google-auth` run — see below |
+   | `SUPABASE_URL` | (accounts) the Homebase Supabase project URL |
+   | `SUPABASE_ANON_KEY` | (accounts) the project's anon/publishable key |
+   | `SUPABASE_SERVICE_ROLE_KEY` | (accounts) the service role key — mark sensitive |
+   | `HOMEBASE_INVITE_CODE` | (accounts) what family members type to create an account |
+   | `RESEND_API_KEY` / `HOMEBASE_EMAIL_FROM` | (accounts) sends the "forgot username" email, e.g. `Homebase <hello@yourdomain>` |
 
    Railway injects `PORT` automatically; the server reads it.
 
 4. **Generate a domain**: Service → Settings → Networking → Generate Domain.
-   That HTTPS URL is what you type into the app's Connect screen.
+   That HTTPS URL is `extra.serverUrl` in the app's app.json.
+
+## Household accounts
+
+App 1.1.0+ signs each person in with a username or email and a password,
+through `/auth/*` here, with Supabase Auth behind it. The schema lives in the
+homebase-app repo (`supabase/migrations/`) and the full contract in its
+`docs/brain-auth.md`. In the Supabase dashboard:
+
+- Authentication → Sign In / Providers: turn **off** "Allow new users to sign up"
+  (the brain creates users after checking `HOMEBASE_INVITE_CODE`).
+- Authentication → Emails → SMTP: set up custom SMTP (e.g. Resend). The built-in
+  mailer only reaches the project's team members.
+- Authentication → Emails → Reset Password template: send the code, e.g.
+  `Your Homebase reset code is {{ .Token }}. It expires in 1 hour.`
+
+Without the `SUPABASE_*` variables accounts stay off and only
+`HOMEBASE_SERVER_TOKEN` works. With them, both work, so 1.0.0 phones keep running
+until they update.
 
 ## Google Calendar on the server (optional)
 
